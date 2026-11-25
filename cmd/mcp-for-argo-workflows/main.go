@@ -1,4 +1,4 @@
-// Package main is the entry point for the MCP server for Argo Workflows.
+// Package main is the entry point for mcp-for-argo-workflows.
 package main
 
 import (
@@ -8,116 +8,109 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/pipekit/mcp-for-argo-workflows/internal/config"
 	"github.com/pipekit/mcp-for-argo-workflows/internal/server"
 	"github.com/pipekit/mcp-for-argo-workflows/internal/version"
 	"github.com/pipekit/mcp-for-argo-workflows/pkg/argo"
+	"github.com/pipekit/mcp-for-argo-workflows/pkg/governance"
+	"github.com/pipekit/mcp-for-argo-workflows/pkg/toolsets"
 )
 
 const serverName = "mcp-for-argo-workflows"
 
 func main() {
-	// Configure structured logging to stderr
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	// Structured single-line JSON logs to stderr (stdout is reserved for stdio MCP JSON-RPC).
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 	slog.SetDefault(logger)
 
-	// Create root context with signal handling for graceful shutdown
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-
 	err := run(ctx)
-	cancel() // Ensure signal handler is stopped before exit
+	cancel()
 
 	if err != nil {
-		slog.Error("server error", "error", err)
+		slog.Error("server exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
 func run(ctx context.Context) error {
-	// Parse configuration from CLI flags and environment variables
 	cfg, err := config.NewFromFlags()
 	if err != nil {
 		return fmt.Errorf("failed to parse configuration: %w", err)
 	}
-
-	// Validate configuration
-	if validateErr := cfg.Validate(); validateErr != nil {
-		return fmt.Errorf("invalid configuration: %w", validateErr)
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
 	}
 
-	// Create the Argo Workflows client with the root context. In multi-context
-	// mode the client can additionally serve other kubeconfig contexts per call.
 	var argoClient argo.ClientInterface
 	if cfg.MultiContextEnabled() {
-		multiClient, clientErr := argo.NewMultiContextClient(ctx, cfg.ToArgoConfig(), cfg.AllowedContexts)
+		mc, clientErr := argo.NewMultiContextClient(ctx, cfg.ToArgoConfig(), cfg.AllowedContexts)
 		if clientErr != nil {
-			return fmt.Errorf("failed to create Argo client: %w", clientErr)
+			return fmt.Errorf("failed to create Argo multi-context client: %w", clientErr)
 		}
-		argoClient = multiClient
+		argoClient = mc
 	} else {
-		client, clientErr := argo.NewClient(ctx, cfg.ToArgoConfig())
+		c, clientErr := argo.NewClient(ctx, cfg.ToArgoConfig())
 		if clientErr != nil {
 			return fmt.Errorf("failed to create Argo client: %w", clientErr)
 		}
-		argoClient = client
+		argoClient = c
 	}
 
-	// Use the client's context which contains K8s auth metadata for all subsequent operations.
-	// The Argo SDK embeds the K8s client in this context, which is required for authorization checks.
-	//nolint:contextcheck // Intentionally replacing context with Argo SDK's context containing K8s client
-	ctx = argoClient.Context()
+	// Propagate Argo SDK client context (logger + Direct K8s gatekeeper clients).
+	//nolint:contextcheck // Required by Argo SDK apiclient architecture
+	baseCtx := argoClient.Context()
 
-	// Create the MCP server with name and version
-	srv := server.NewServer(serverName, version.Version)
+	deps := toolsets.Dependencies{
+		Client:           argoClient,
+		ScopeFence:       cfg.ToScopeFence(),
+		MRTRGate:         governance.NewMRTRGate(cfg.RequestStateSecret, 300*time.Second),
+		MaxResponseBytes: cfg.MaxResponseBytes,
+	}
+	sel := toolsets.SelectionConfig{
+		Toolsets: cfg.Toolsets,
+		Tools:    cfg.Tools,
+		ReadOnly: cfg.ReadOnly,
+	}
 
-	// Register Argo Workflows tools
-	srv.RegisterTools(argoClient, cfg.ReadOnly)
+	srv, err := server.NewServer(serverName, version.Version, deps, sel)
+	if err != nil {
+		return fmt.Errorf("failed to initialize MCP server: %w", err)
+	}
 
-	// Register Argo CRD schema resources
-	srv.RegisterResources()
+	mode := "kubernetes"
+	if argoClient.IsArgoServerMode() {
+		mode = "argo-server"
+	}
 
-	// Register dynamic cluster resources (requires Argo client)
-	srv.RegisterClusterResources(argoClient)
-
-	// Register MCP prompts
-	srv.RegisterPrompts(argoClient)
-
-	slog.Info("MCP server created",
+	slog.Info("mcp-for-argo-workflows initialized",
 		"name", serverName,
 		"version", version.Version,
 		"transport", cfg.Transport,
+		"mode", mode,
 		"namespace", cfg.Namespace,
-		"read_only", cfg.ReadOnly,
-		"multi_context", cfg.MultiContextEnabled(),
+		"readOnly", cfg.ReadOnly,
+		"toolsets", cfg.Toolsets,
+		"toolCount", len(srv.RegisteredTools()),
+		"tools", srv.RegisteredTools(),
+		"multiContext", cfg.MultiContextEnabled(),
 	)
 
-	if cfg.ReadOnly {
-		slog.Info("read-only mode enabled: mutating tools are disabled")
-	}
-
-	// Log the reachable context set so operators can see exactly which
-	// clusters tool calls may act on.
-	if cfg.MultiContextEnabled() {
-		if names, defaultContext, listErr := argoClient.ListKubeContexts(); listErr == nil {
-			slog.Info("multi-context enabled: kubeconfig contexts are selectable per tool call",
-				"contexts", names,
-				"default", defaultContext,
-			)
+	if cfg.UsesHTTPListener() {
+		listenerSec, secErr := cfg.ResolveListenerSecurity()
+		if secErr != nil {
+			return secErr
 		}
+		return srv.RunStreamableHTTP(baseCtx, server.HTTPOptions{ //nolint:contextcheck // baseCtx carries Argo SDK context
+			Security:     listenerSec,
+			LegacyMode:   cfg.LegacyMode,
+			JSONResponse: cfg.JSONResponse,
+		})
 	}
 
-	// Start the server with the configured transport.
-	// The ctx here is the Argo SDK context (see nolint:contextcheck above).
-	switch {
-	case cfg.IsStreamableHTTPTransport():
-		slog.Info("starting streamable HTTP transport", "addr", cfg.HTTPAddr, "path", server.MCPPath)
-		return srv.RunStreamableHTTP(ctx, cfg.HTTPAddr) //nolint:contextcheck // ctx is Argo SDK context with K8s client
-	case cfg.IsHTTPTransport():
-		slog.Info("starting HTTP transport", "addr", cfg.HTTPAddr)
-		return srv.RunHTTP(ctx, cfg.HTTPAddr) //nolint:contextcheck // ctx is Argo SDK context with K8s client
-	default:
-		// Default to stdio transport
-		return srv.RunStdio(ctx) //nolint:contextcheck // ctx is Argo SDK context with K8s client
-	}
+	return srv.RunStdio(baseCtx) //nolint:contextcheck // baseCtx carries Argo SDK context
 }

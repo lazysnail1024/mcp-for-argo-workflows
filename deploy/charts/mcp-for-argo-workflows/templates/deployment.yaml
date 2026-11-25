@@ -1,0 +1,276 @@
+{{- if and (ne .Values.argo.mode "argo-server") (ne .Values.argo.mode "kubernetes") -}}
+{{- fail (printf "argo.mode must be either \"argo-server\" or \"kubernetes\", got %q" .Values.argo.mode) -}}
+{{- end -}}
+{{- $isArgoServer := eq .Values.argo.mode "argo-server" -}}
+{{- $isKubernetes := eq .Values.argo.mode "kubernetes" -}}
+{{- if and $isArgoServer (empty .Values.argo.serverUrl) -}}
+{{- fail "argo.serverUrl must be non-empty when argo.mode is \"argo-server\"" -}}
+{{- end -}}
+{{- $secretName := include "mcp-argo-workflows.secretName" . -}}
+{{- $caFileName := "" -}}
+{{- if and $isArgoServer .Values.argo.caCert.enabled -}}
+  {{- if .Values.argo.caCert.pem -}}
+    {{- $caFileName = "ca.crt" -}}
+  {{- else if .Values.argo.caCert.existingConfigMap -}}
+    {{- $caFileName = .Values.argo.caCert.configMapKey -}}
+  {{- else if .Values.argo.caCert.existingSecret -}}
+    {{- $caFileName = .Values.argo.caCert.secretKey -}}
+  {{- else -}}
+    {{- fail "argo.caCert.enabled=true requires one of argo.caCert.pem, existingConfigMap, or existingSecret" -}}
+  {{- end -}}
+{{- end -}}
+{{- $useCA := and $isArgoServer .Values.argo.caCert.enabled -}}
+{{- $useRegistry := and $isArgoServer .Values.argo.tokenRegistry.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mcp-argo-workflows.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mcp-argo-workflows.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- with .Values.updateStrategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "mcp-argo-workflows.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- $hasChecksum := or .Values.secrets.create (and $useCA .Values.argo.caCert.pem) (and $useRegistry .Values.argo.tokenRegistry.createSecret) }}
+      {{- if or $hasChecksum .Values.podAnnotations }}
+      annotations:
+        {{- if .Values.secrets.create }}
+        checksum/secret: {{ printf "%s|%s|%s" .Values.secrets.mcpAuthToken .Values.secrets.argoToken .Values.secrets.mcpRequestStateSecret | sha256sum }}
+        {{- end }}
+        {{- if and $useCA .Values.argo.caCert.pem }}
+        checksum/ca-config: {{ .Values.argo.caCert.pem | sha256sum }}
+        {{- end }}
+        {{- if and $useRegistry .Values.argo.tokenRegistry.createSecret }}
+        checksum/token-registry: {{ .Values.argo.tokenRegistry.entries | toJson | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      labels:
+        {{- include "mcp-argo-workflows.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "mcp-argo-workflows.serviceAccountName" . }}
+      automountServiceAccountToken: {{ ternary true .Values.serviceAccount.automount $isKubernetes }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ include "mcp-argo-workflows.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - http
+            - --port
+            - {{ .Values.mcp.port | quote }}
+            - --bind-address
+            - {{ .Values.mcp.bindAddress | quote }}
+            - --stateless={{ .Values.mcp.stateless }}
+            - --json-response={{ .Values.mcp.jsonResponse }}
+            - --legacy-mode
+            - {{ .Values.mcp.legacyMode | quote }}
+            {{- range .Values.mcp.allowedHostHeaders }}
+            - --allowed-host-header
+            - {{ . | quote }}
+            {{- end }}
+            {{- range .Values.mcp.allowedOrigins }}
+            - --allowed-origin
+            - {{ . | quote }}
+            {{- end }}
+            {{- if .Values.mcp.allowUnauthenticated }}
+            - --allow-unauthenticated
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mcp.port }}
+              protocol: TCP
+          env:
+            - name: MCP_BIND_ADDRESS
+              value: {{ .Values.mcp.bindAddress | quote }}
+            - name: MCP_PORT
+              value: {{ .Values.mcp.port | quote }}
+            - name: MCP_TOOLSETS
+              value: {{ .Values.mcp.toolsets | quote }}
+            {{- if .Values.mcp.tools }}
+            - name: MCP_TOOLS
+              value: {{ join "," .Values.mcp.tools | quote }}
+            {{- end }}
+            - name: MCP_READ_ONLY
+              value: {{ .Values.mcp.readOnly | quote }}
+            - name: MCP_LEGACY_MODE
+              value: {{ .Values.mcp.legacyMode | quote }}
+            - name: MCP_ALLOW_CLUSTER_TEMPLATES
+              value: {{ .Values.mcp.allowClusterTemplates | quote }}
+            - name: MCP_ALLOW_ARCHIVE_DELETE
+              value: {{ .Values.mcp.allowArchiveDelete | quote }}
+            - name: MCP_MAX_RESPONSE_BYTES
+              value: {{ .Values.mcp.maxResponseBytes | quote }}
+            {{- if .Values.mcp.allowedNamespaces }}
+            - name: MCP_ALLOWED_NAMESPACES
+              value: {{ join "," .Values.mcp.allowedNamespaces | quote }}
+            {{- end }}
+            {{- if .Values.mcp.deniedNamespaces }}
+            - name: MCP_DENIED_NAMESPACES
+              value: {{ join "," .Values.mcp.deniedNamespaces | quote }}
+            {{- end }}
+            - name: ARGO_NAMESPACE
+              value: {{ .Values.argo.namespace | default .Release.Namespace | quote }}
+            {{- if $isArgoServer }}
+            - name: ARGO_SERVER
+              value: {{ .Values.argo.serverUrl | quote }}
+            - name: ARGO_HTTP1
+              value: {{ .Values.argo.http1 | quote }}
+            - name: ARGO_SECURE
+              value: {{ .Values.argo.secure | quote }}
+            - name: ARGO_INSECURE_SKIP_VERIFY
+              value: {{ .Values.argo.insecureSkipVerify | quote }}
+            {{- end }}
+            {{- if or (not .Values.mcp.allowUnauthenticated) (and .Values.secrets.create .Values.secrets.mcpAuthToken) }}
+            - name: MCP_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: {{ .Values.secrets.keys.mcpAuthToken }}
+                  optional: {{ .Values.mcp.allowUnauthenticated }}
+            {{- end }}
+            - name: MCP_REQUEST_STATE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: {{ .Values.secrets.keys.mcpRequestStateSecret }}
+                  optional: {{ not .Values.secrets.create }}
+            {{- if and $isArgoServer (or (not $useRegistry) (and .Values.secrets.create .Values.secrets.argoToken) (not .Values.secrets.create)) }}
+            - name: ARGO_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: {{ .Values.secrets.keys.argoToken }}
+                  optional: {{ $useRegistry }}
+            {{- end }}
+            {{- if $useRegistry }}
+            - name: ARGO_TOKEN_REGISTRY_PATH
+              value: {{ printf "%s/%s" (trimSuffix "/" .Values.argo.tokenRegistry.mountPath) .Values.argo.tokenRegistry.secretKey | quote }}
+            {{- end }}
+            {{- if $useCA }}
+            - name: ARGO_CA_CERT
+              value: {{ printf "%s/%s" (trimSuffix "/" .Values.argo.caCert.mountPath) $caFileName | quote }}
+            - name: SSL_CERT_FILE
+              value: {{ printf "%s/%s" (trimSuffix "/" .Values.argo.caCert.mountPath) $caFileName | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if or $useCA $useRegistry .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- if $useCA }}
+            - name: argo-ca
+              mountPath: {{ .Values.argo.caCert.mountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if $useRegistry }}
+            - name: token-registry
+              mountPath: {{ .Values.argo.tokenRegistry.mountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+      {{- if or $useCA $useRegistry .Values.extraVolumes }}
+      volumes:
+        {{- if $useCA }}
+        - name: argo-ca
+          {{- if .Values.argo.caCert.pem }}
+          configMap:
+            name: {{ include "mcp-argo-workflows.caConfigMapName" . }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+          {{- else if .Values.argo.caCert.existingConfigMap }}
+          configMap:
+            name: {{ .Values.argo.caCert.existingConfigMap }}
+            items:
+              - key: {{ .Values.argo.caCert.configMapKey }}
+                path: {{ .Values.argo.caCert.configMapKey }}
+          {{- else }}
+          secret:
+            secretName: {{ .Values.argo.caCert.existingSecret }}
+            items:
+              - key: {{ .Values.argo.caCert.secretKey }}
+                path: {{ .Values.argo.caCert.secretKey }}
+          {{- end }}
+        {{- end }}
+        {{- if $useRegistry }}
+        - name: token-registry
+          secret:
+            secretName: {{ include "mcp-argo-workflows.registrySecretName" . }}
+            items:
+              - key: {{ .Values.argo.tokenRegistry.secretKey }}
+                path: {{ .Values.argo.tokenRegistry.secretKey }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if eq .Values.podAntiAffinityPreset "soft" }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "mcp-argo-workflows.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- else if eq .Values.podAntiAffinityPreset "hard" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "mcp-argo-workflows.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

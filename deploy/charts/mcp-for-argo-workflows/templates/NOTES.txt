@@ -1,0 +1,52 @@
+===============================================================================
+mcp-for-argo-workflows ({{ .Chart.AppVersion }}) 已部署至命名空间: {{ .Release.Namespace }}
+===============================================================================
+
+1. 检查 Pod、Service{{ if .Values.istio.virtualService.enabled }} 与 Istio VirtualService{{ end }} 状态:
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "mcp-argo-workflows.fullname" . }}
+   kubectl -n {{ .Release.Namespace }} get pods,svc,pdb -l app.kubernetes.io/instance={{ .Release.Name }}
+{{- if .Values.istio.virtualService.enabled }}
+   kubectl -n {{ .Release.Namespace }} get virtualservice {{ include "mcp-argo-workflows.fullname" . }}
+{{- end }}
+{{- if .Values.istio.authorizationPolicy.enabled }}
+   kubectl -n {{ .Values.istio.authorizationPolicy.namespace | default "istio-system" }} get authorizationpolicy {{ printf "%s-ip-guard" (include "mcp-argo-workflows.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+2. 服务接入地址与验证:
+{{- if .Values.istio.virtualService.enabled }}
+{{- $host := index .Values.istio.virtualService.hosts 0 }}
+{{- $path := trimSuffix "/" .Values.istio.virtualService.path }}
+   - 对外 MCP Endpoint: https://{{ $host }}{{ $path }}
+   - 集群内部 Service : http://{{ include "mcp-argo-workflows.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+   - 客户端请求头     : Authorization: Bearer <MCP_AUTH_TOKEN>
+   - 可选审计请求头   : X-MCP-Caller: <员工英文名/工号>
+
+   快速验证（无 Token 应返回 401，/healthz 应返回 404 不对外暴露）:
+   curl -i -X POST "https://{{ $host }}{{ $path }}" \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+
+   携带 Token 验证（默认只读应返回 200 及 12 个只读工具）:
+   curl -fsS -X POST "https://{{ $host }}{{ $path }}" \
+     -H "Authorization: Bearer <MCP_AUTH_TOKEN>" \
+     -H "Content-Type: application/json" \
+     -H "Accept: application/json, text/event-stream" \
+     -H "X-MCP-Caller: deploy-verify" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+{{- else }}
+   # ClusterIP / 集群内模式（可通过 port-forward 验证）:
+   kubectl -n {{ .Release.Namespace }} port-forward --address 127.0.0.1 svc/{{ include "mcp-argo-workflows.fullname" . }} 18080:{{ .Values.service.port }}
+   curl -fsS "http://127.0.0.1:18080/healthz"
+{{- end }}
+
+当前运行与安全基线:
+  - Downstream Mode    : {{ .Values.argo.mode }}{{ if eq .Values.argo.mode "argo-server" }} ({{ .Values.argo.serverUrl }}, http1={{ .Values.argo.http1 }}){{ else }} (in-cluster K8s API, clusterScope={{ .Values.rbac.clusterScope }}){{ end }}
+  - Default Namespace  : {{ .Values.argo.namespace | default .Release.Namespace }}
+  - Toolsets           : {{ .Values.mcp.toolsets }} (MCP_READ_ONLY={{ .Values.mcp.readOnly }})
+  - Legacy Mode        : {{ .Values.mcp.legacyMode }} (jsonResponse={{ .Values.mcp.jsonResponse }})
+{{- if .Values.mcp.allowedHostHeaders }}
+  - Allowed Host Header: {{ join ", " .Values.mcp.allowedHostHeaders }}
+{{- end }}
+{{- if and .Values.istio.virtualService.enabled (not .Values.istio.authorizationPolicy.enabled) }}
+  - Istio IP 白名单     : 未启用（由前置公网 ELB 访问控制策略保障来源白名单）
+{{- end }}

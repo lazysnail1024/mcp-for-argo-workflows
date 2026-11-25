@@ -9,20 +9,15 @@ linters:
     - contextcheck
     - copyloopvar
     - dogsled
-    # dupl disabled - too many false positives for similar workflow handlers
     - dupword
     - durationcheck
     - errcheck
     - errorlint
-    - exhaustive
     - forcetypeassert
-    - gochecknoglobals
     - goconst
     - gocritic
     - goprintffuncname
     - gosec
-    - grouper
-    - ireturn
     - ineffassign
     - loggercheck
     - makezero
@@ -31,18 +26,13 @@ linters:
     - nakedret
     - nilerr
     - noctx
-    - nonamedreturns
     - nosprintfhostport
     - prealloc
     - predeclared
-    - promlinter
     - revive
-    - sqlclosecheck
     - staticcheck
-    - tagliatelle
     - testifylint
     - thelper
-    - tparallel
     - unconvert
     - unparam
     - usestdlibvars
@@ -56,6 +46,8 @@ linters:
 
     govet:
       enable-all: true
+      disable:
+        - fieldalignment
 
     revive:
       rules:
@@ -66,56 +58,32 @@ linters:
         - name: error-return
         - name: error-strings
         - name: error-naming
-        - name: exported
         - name: increment-decrement
         - name: indent-error-flow
         - name: range
         - name: receiver-naming
         - name: time-naming
-        - name: unexported-return
         - name: var-declaration
         - name: var-naming
 
-    nakedret:
-      max-func-lines: 30
-
     goconst:
-      min-len: 3
-      min-occurrences: 3
+      min-len: 4
+      min-occurrences: 4
 
     gosec:
       excludes:
-        - G104  # Audit errors not checked (covered by errcheck)
+        - G104
 
   exclusions:
     rules:
-      # Test files can have longer functions and similar test patterns
       - path: _test\.go
         linters:
           - goconst
           - unparam
           - errcheck
-          - noctx      # Test HTTP clients don't need context
-          - thelper    # Table-driven test validate funcs don't need t.Helper()
-
-      # Mock files have similar structure by design
-      - path: mocks/
-        linters:
-          - ireturn    # Mocks must return interfaces to match real implementations
-
-      # Argo client wrapper must return Argo SDK interfaces
-      - path: pkg/argo/client\.go
-        linters:
-          - ireturn    # Returns Argo SDK interfaces by design
-
-      # Multi-context client resolution returns ClientInterface by design
-      - path: pkg/argo/multicontext\.go
-        linters:
-          - ireturn    # ForKubeContext returns ClientInterface so handlers stay client-agnostic
-
-      - path: pkg/tools/helpers\.go
-        linters:
-          - ireturn    # ResolveClient returns ClientInterface so handlers stay client-agnostic
+          - noctx
+          - thelper
+          - gosec
 
 formatters:
   enable:

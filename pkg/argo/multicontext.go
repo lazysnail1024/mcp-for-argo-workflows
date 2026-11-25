@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -12,63 +11,50 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// MultiContextClient is a Client for the default kubeconfig context that can
-// also serve other contexts per call via ForKubeContext, lazily building and
-// caching one Client per context name.
-//
-// It is the single enforcement point for per-call context selection: names are
-// validated against the kubeconfig contexts and the allowlist snapshotted at
-// startup (editing the kubeconfig requires a server restart), and clients are
-// only ever built for names that pass both checks. Unknown and disallowed
-// names produce identical errors so the allowlist does not reveal which hidden
-// contexts exist.
-// Fields are ordered for memory alignment rather than by topic.
+// MultiContextClient serves the default kubeconfig context and lazily resolves
+// additional allowlisted kubeconfig contexts per call via ResolveTarget.
 type MultiContextClient struct {
-	// baseCtx is the startup context used to construct per-context clients, so
-	// their lifetime is tied to the server process rather than a single call.
-	baseCtx context.Context //nolint:containedctx // Mirrors Client's Argo SDK pattern
+	baseCtx context.Context //nolint:containedctx // Matches Argo SDK client lifetime model
 
 	*Client
 
-	config *Config
-	// available is the set of selectable context names: present in the
-	// kubeconfig at startup and, when an allowlist is configured, listed in it.
-	available map[string]struct{}
-	// newClient builds a Client for a cloned per-context Config. Injectable so
-	// tests can avoid contacting real clusters.
-	newClient      func(context.Context, *Config) (*Client, error)
-	cache          map[string]*Client
-	defaultContext string
-	// names is the sorted form of available, served by ListKubeContexts.
-	names []string
-	// mu guards cache. It is held while building a client so concurrent first
-	// calls for a context produce exactly one Client; that serializes builds,
-	// which happen at most once per context.
-	mu sync.Mutex
+	config            *Config
+	available         map[string]struct{}
+	contextNamespaces map[string]string
+	newClient         func(context.Context, *Config) (*Client, error)
+	cache             map[string]*Client
+	defaultContext    string
+	names             []string
+	mu                sync.Mutex
 }
 
-// Ensure MultiContextClient implements ClientInterface.
 var _ ClientInterface = (*MultiContextClient)(nil)
 
-// NewMultiContextClient creates a client for the default kubeconfig context
-// that can also serve other contexts per call. When allowedContexts is
-// non-empty it restricts the selectable contexts and must include the default
-// context, otherwise construction fails.
-func NewMultiContextClient(ctx context.Context, config *Config, allowedContexts []string) (*MultiContextClient, error) {
-	base, err := NewClient(ctx, config)
+// NewMultiContextClient creates a Direct K8s multi-context client bounded by allowedContexts.
+func NewMultiContextClient(ctx context.Context, cfg *Config, allowedContexts []string) (*MultiContextClient, error) {
+	base, err := NewClient(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	return newMultiContextClient(ctx, base, config, allowedContexts, NewClient)
+	return newMultiContextClient(ctx, base, cfg, allowedContexts, NewClient)
 }
 
-func newMultiContextClient(ctx context.Context, base *Client, config *Config, allowedContexts []string, newClient func(context.Context, *Config) (*Client, error)) (*MultiContextClient, error) {
-	rawConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(buildLoadingRules(config.Kubeconfig), &clientcmd.ConfigOverrides{}).RawConfig()
+func newMultiContextClient(
+	ctx context.Context,
+	base *Client,
+	cfg *Config,
+	allowedContexts []string,
+	newClient func(context.Context, *Config) (*Client, error),
+) (*MultiContextClient, error) {
+	rawConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		buildLoadingRules(cfg.Kubeconfig),
+		&clientcmd.ConfigOverrides{},
+	).RawConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read kubeconfig contexts: %w", err)
 	}
 
-	defaultContext := config.Context
+	defaultContext := cfg.Context
 	if defaultContext == "" {
 		defaultContext = rawConfig.CurrentContext
 	}
@@ -86,8 +72,9 @@ func newMultiContextClient(ctx context.Context, base *Client, config *Config, al
 	}
 
 	available := make(map[string]struct{}, len(rawConfig.Contexts))
+	contextNamespaces := make(map[string]string, len(rawConfig.Contexts))
 	names := make([]string, 0, len(rawConfig.Contexts))
-	for name := range rawConfig.Contexts {
+	for name, kctx := range rawConfig.Contexts {
 		if len(allowed) > 0 {
 			if _, ok := allowed[name]; !ok {
 				continue
@@ -95,74 +82,115 @@ func newMultiContextClient(ctx context.Context, base *Client, config *Config, al
 		}
 		available[name] = struct{}{}
 		names = append(names, name)
+		if kctx != nil && strings.TrimSpace(kctx.Namespace) != "" {
+			contextNamespaces[name] = strings.TrimSpace(kctx.Namespace)
+		}
 	}
 	sort.Strings(names)
 
 	return &MultiContextClient{
-		Client:         base,
-		baseCtx:        ctx,
-		config:         config,
-		defaultContext: defaultContext,
-		available:      available,
-		names:          names,
-		newClient:      newClient,
-		cache:          make(map[string]*Client),
+		Client:            base,
+		baseCtx:           ctx,
+		config:            cfg,
+		defaultContext:    defaultContext,
+		available:         available,
+		contextNamespaces: contextNamespaces,
+		names:             names,
+		newClient:         newClient,
+		cache:             make(map[string]*Client),
 	}, nil
 }
 
-// ForKubeContext returns a client bound to the named kubeconfig context,
-// building and caching it on first use. An empty name or the default context
-// name returns the receiver.
-func (m *MultiContextClient) ForKubeContext(name string) (ClientInterface, error) {
-	name = strings.TrimSpace(name)
+// MultiContextEnabled reports true: per-call kubeconfig context selection is active.
+func (m *MultiContextClient) MultiContextEnabled() bool {
+	return true
+}
+
+// ResolveTarget selects the allowlisted kubeconfig context for this call.
+func (m *MultiContextClient) ResolveTarget(ctx context.Context, argoBaseURL, kubeContext string) (context.Context, ClientInterface, error) {
+	if strings.TrimSpace(argoBaseURL) != "" {
+		return nil, nil, ErrArgoBaseURLUnavailable
+	}
+	name := strings.TrimSpace(kubeContext)
 	if name == "" || name == m.defaultContext {
-		return m, nil
+		return MergeContext(ctx, m.ctx), m, nil
 	}
 
 	if _, ok := m.available[name]; !ok {
-		return nil, fmt.Errorf("context %q is not available (use list_contexts to see available contexts)", name)
+		return nil, nil, fmt.Errorf("context %q is not available (call list_clusters to see selectable contexts)", name)
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if client, ok := m.cache[name]; ok {
-		return client, nil
+		return MergeContext(ctx, client.Context()), client, nil
 	}
 
-	contextConfig := *m.config
-	contextConfig.Context = name
-	client, err := m.newClient(m.baseCtx, &contextConfig)
+	contextCfg := *m.config
+	contextCfg.Context = name
+	if ns := m.contextNamespaces[name]; ns != "" && contextCfg.Namespace == defaultNamespace {
+		contextCfg.Namespace = ns
+	}
+	client, err := m.newClient(context.WithoutCancel(m.baseCtx), &contextCfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create client for context %q: %w", name, err)
+		return nil, nil, fmt.Errorf("failed to create client for context %q: %w", name, err)
 	}
 	m.cache[name] = client
-	slog.Info("created client for kubeconfig context", "context", name)
-	return client, nil
+	slog.Info("created client for kubeconfig context", "context", name, "namespace", client.DefaultNamespace())
+	return MergeContext(ctx, client.Context()), client, nil
 }
 
-// ListKubeContexts returns the selectable kubeconfig context names, sorted,
-// along with the default context name.
-func (m *MultiContextClient) ListKubeContexts() ([]string, string, error) {
-	return slices.Clone(m.names), m.defaultContext, nil
+// ListTargets lists all selectable kubeconfig contexts along with their default namespace.
+func (m *MultiContextClient) ListTargets(ctx context.Context) ([]TargetDescriptor, error) {
+	defaultInfo, _ := m.ProbeClusterInfo(ctx)
+	defaultVer := ""
+	if defaultInfo != nil {
+		defaultVer = defaultInfo.ArgoVersion
+	}
+
+	targets := make([]TargetDescriptor, 0, len(m.names))
+	for _, name := range m.names {
+		ns := m.contextNamespaces[name]
+		if ns == "" {
+			ns = m.config.Namespace
+		}
+		isDefault := name == m.defaultContext
+		ver := ""
+		if isDefault {
+			ver = defaultVer
+		}
+		targets = append(targets, TargetDescriptor{
+			Name:             name,
+			Mode:             modeKubernetesDirect,
+			Default:          isDefault,
+			DefaultNamespace: ns,
+			ArchiveSupported: false,
+			Version:          ver,
+			Protocol:         "k8s-json",
+		})
+	}
+	sort.SliceStable(targets, func(i, j int) bool {
+		if targets[i].Default != targets[j].Default {
+			return targets[i].Default
+		}
+		return targets[i].Name < targets[j].Name
+	})
+	return targets, nil
 }
 
-// MultiContextEnabled reports true: this client supports per-call kubeconfig
-// context selection.
-func (m *MultiContextClient) MultiContextEnabled() bool {
-	return true
+// MergeContext draws cancellation and deadlines from request while resolving Argo SDK
+// metadata values (logger, K8s gatekeeper clients) from clientValues first.
+func MergeContext(request, clientValues context.Context) context.Context {
+	if request == nil {
+		return clientValues
+	}
+	if clientValues == nil {
+		return request
+	}
+	return mergedContext{Context: request, values: clientValues}
 }
 
-// MergeContext returns a context that draws cancellation and deadline from
-// request, and context values from values before falling back to request. The
-// Argo SDK embeds each cluster's authentication in its client's context, so
-// handlers switching context must run calls with the selected client's values
-// while preserving the MCP request's cancellation — otherwise the call would
-// silently execute against the default cluster.
-func MergeContext(request, values context.Context) context.Context {
-	return mergedContext{Context: request, values: values}
-}
-
-//nolint:containedctx // Exists to combine two contexts; holding them is the point.
+//nolint:containedctx // Intentionally combines request cancellation with Argo client values.
 type mergedContext struct {
 	context.Context
 	values context.Context

@@ -1,29 +1,12 @@
-# Build artifacts
-dist/
-bin/
+.git
+.github
+dist
+doc
+deploy
+examples
+scripts
+test
 coverage.out
 coverage.html
-
-# Git
-.git/
-.gitignore
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Documentation
 *.md
-!go.mod
-
-# CI/CD
-.github/
-
-# Environment
-.env
-.env.local
-
-# Docker (keep Dockerfile and .dockerignore in context)
+*_test.go

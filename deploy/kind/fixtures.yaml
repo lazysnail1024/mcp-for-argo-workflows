@@ -1,0 +1,215 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-wf-e2e-system
+  labels:
+    app.kubernetes.io/part-of: mcp-for-argo-workflows-e2e
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-wf-e2e-work
+  labels:
+    app.kubernetes.io/part-of: mcp-for-argo-workflows-e2e
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-wf-e2e-denied
+  labels:
+    app.kubernetes.io/part-of: mcp-for-argo-workflows-e2e
+---
+# Workflow pod runner SA inside mcp-wf-e2e-work (required by argoexec v3.6+)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: e2e-wf-runner
+  namespace: mcp-wf-e2e-work
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: e2e-wf-runner
+  namespace: mcp-wf-e2e-work
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflowtaskresults"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: e2e-wf-runner
+  namespace: mcp-wf-e2e-work
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: e2e-wf-runner
+subjects:
+  - kind: ServiceAccount
+    name: e2e-wf-runner
+    namespace: mcp-wf-e2e-work
+---
+# Isolated SA whose token authenticates MCP -> argo-server (scoped ONLY to mcp-wf-e2e-* namespaces)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: e2e-mcp-argo-client
+  namespace: mcp-wf-e2e-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: e2e-mcp-argo-client-token
+  namespace: mcp-wf-e2e-system
+  annotations:
+    kubernetes.io/service-account.name: e2e-mcp-argo-client
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: e2e-mcp-argo-client
+  namespace: mcp-wf-e2e-work
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources:
+      - workflows
+      - workflowtemplates
+      - cronworkflows
+      - workflowtaskresults
+      - workflowtasksets
+      - archivedworkflows
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: e2e-mcp-argo-client
+  namespace: mcp-wf-e2e-work
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: e2e-mcp-argo-client
+subjects:
+  - kind: ServiceAccount
+    name: e2e-mcp-argo-client
+    namespace: mcp-wf-e2e-system
+---
+# Also grant read RBAC in mcp-wf-e2e-denied to prove MCP_DENIED_NAMESPACES enforces fencing at MCP layer
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: e2e-mcp-argo-client-denied-read
+  namespace: mcp-wf-e2e-denied
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflows", "workflowtemplates", "cronworkflows"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: e2e-mcp-argo-client-denied-read
+  namespace: mcp-wf-e2e-denied
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: e2e-mcp-argo-client-denied-read
+subjects:
+  - kind: ServiceAccount
+    name: e2e-mcp-argo-client
+    namespace: mcp-wf-e2e-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: e2e-mcp-argo-cwt-reader
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["clusterworkflowtemplates"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: e2e-mcp-argo-cwt-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: e2e-mcp-argo-cwt-reader
+subjects:
+  - kind: ServiceAccount
+    name: e2e-mcp-argo-client
+    namespace: mcp-wf-e2e-system
+---
+# Approved WorkflowTemplate for trigger_workflow (ops toolset)
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: e2e-approved-tmpl
+  namespace: mcp-wf-e2e-work
+  labels:
+    e2e.mcp/approved: "true"
+spec:
+  serviceAccountName: e2e-wf-runner
+  entrypoint: greet
+  arguments:
+    parameters:
+      - name: message
+        value: "hello-from-template"
+  templates:
+    - name: greet
+      inputs:
+        parameters:
+          - name: message
+      container:
+        image: busybox:1.36
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args: ["echo \"APPROVED_RUN: {{inputs.parameters.message}}\""]
+---
+# Authentic Argo Workflows v3.6 legacy CronWorkflow (singular spec.schedule + synchronization.mutex)
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: e2e-legacy-v36-cron
+  namespace: mcp-wf-e2e-work
+  labels:
+    e2e.mcp/compat: "v36-singular"
+spec:
+  schedule: "15 4 * * *"
+  timezone: "UTC"
+  suspend: true
+  concurrencyPolicy: "Forbid"
+  workflowSpec:
+    serviceAccountName: e2e-wf-runner
+    entrypoint: noop
+    synchronization:
+      mutex:
+        name: "e2e-v36-legacy-lock"
+    templates:
+      - name: noop
+        container:
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["echo", "v36-cron-noop"]
+---
+# Template inside denied namespace (must be blocked by MCP_DENIED_NAMESPACES)
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: e2e-denied-tmpl
+  namespace: mcp-wf-e2e-denied
+spec:
+  serviceAccountName: default
+  entrypoint: noop
+  templates:
+    - name: noop
+      container:
+        image: busybox:1.36
+        imagePullPolicy: IfNotPresent
+        command: ["echo", "should-never-be-visible"]

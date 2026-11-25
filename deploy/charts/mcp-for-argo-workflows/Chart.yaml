@@ -1,0 +1,17 @@
+apiVersion: v2
+name: mcp-for-argo-workflows
+description: Stateless, Dual-Era Model Context Protocol (MCP) server for Argo Workflows (v3.6+ and v4.x), ready for Huawei Cloud CCE + Istio deployments
+type: application
+version: 0.6.0
+appVersion: "0.6.0"
+keywords:
+  - argo-workflows
+  - mcp
+  - model-context-protocol
+  - workflows
+  - kubernetes
+home: https://github.com/lazysnail1024/mcp-for-argo-workflows
+sources:
+  - https://github.com/lazysnail1024/mcp-for-argo-workflows
+maintainers:
+  - name: lazysnail1024

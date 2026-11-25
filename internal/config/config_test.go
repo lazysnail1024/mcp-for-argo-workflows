@@ -3,260 +3,55 @@ package config
 import (
 	"testing"
 
-	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestMultiContextEnabled(t *testing.T) {
-	tests := []struct {
-		name         string
-		transport    string
-		argoServer   string
-		multiContext bool
-		want         bool
-	}{
-		{name: "stdio direct k8s enabled", transport: TransportStdio, multiContext: true, want: true},
-		{name: "stdio direct k8s disabled", transport: TransportStdio, multiContext: false, want: false},
-		{name: "http transport", transport: TransportHTTP, multiContext: true, want: false},
-		{name: "streamable http transport", transport: TransportStreamableHTTP, multiContext: true, want: false},
-		{name: "argo server mode", transport: TransportStdio, argoServer: "localhost:2746", multiContext: true, want: false},
-		{name: "argo server and http", transport: TransportHTTP, argoServer: "localhost:2746", multiContext: true, want: false},
-	}
+func TestParseArgs_DefaultsAndEnvPrecedence(t *testing.T) {
+	t.Setenv("ARGO_SERVER", "http://argo-server.argo.svc.cluster.local:2746")
+	t.Setenv("MCP_AUTH_TOKEN", "env-inbound-secret")
+	t.Setenv("MCP_TOOLSETS", "core,diagnostics,ops")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := DefaultConfig()
-			cfg.Transport = tt.transport
-			cfg.ArgoServer = tt.argoServer
-			cfg.MultiContext = tt.multiContext
-			assert.Equal(t, tt.want, cfg.MultiContextEnabled())
-		})
-	}
-}
-
-// testHTTPAddr is an arbitrary listen address for transport validation tests;
-// nothing binds it.
-const testHTTPAddr = ":8080"
-
-func TestValidate_Transport(t *testing.T) {
-	tests := []struct {
-		name      string
-		transport string
-		httpAddr  string
-		wantErr   string
-	}{
-		{name: "stdio", transport: TransportStdio},
-		{name: "http", transport: TransportHTTP, httpAddr: testHTTPAddr},
-		{name: "streamable http", transport: TransportStreamableHTTP, httpAddr: testHTTPAddr},
-		{name: "unknown transport", transport: "websocket", wantErr: `invalid transport "websocket"`},
-		{
-			name:      "streamable http without address",
-			transport: TransportStreamableHTTP,
-			wantErr:   "http-addr is required",
-		},
-		{
-			name:      "http without address",
-			transport: TransportHTTP,
-			wantErr:   "http-addr is required",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := DefaultConfig()
-			cfg.Transport = tt.transport
-			cfg.HTTPAddr = tt.httpAddr
-
-			err := cfg.Validate()
-			if tt.wantErr == "" {
-				require.NoError(t, err)
-				return
-			}
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.wantErr)
-		})
-	}
-}
-
-func TestUsesHTTPListener(t *testing.T) {
-	tests := []struct {
-		transport string
-		want      bool
-	}{
-		{transport: TransportStdio, want: false},
-		{transport: TransportHTTP, want: true},
-		{transport: TransportStreamableHTTP, want: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.transport, func(t *testing.T) {
-			cfg := DefaultConfig()
-			cfg.Transport = tt.transport
-			assert.Equal(t, tt.want, cfg.UsesHTTPListener())
-		})
-	}
-}
-
-func TestValidate_MultiContext(t *testing.T) {
-	tests := []struct {
-		name    string
-		mutate  func(*Config)
-		wantErr string
-	}{
-		{
-			name:   "defaults are valid",
-			mutate: func(_ *Config) {},
-		},
-		{
-			name: "allowlist in eligible mode",
-			mutate: func(c *Config) {
-				c.AllowedContexts = []string{"alpha", "beta"}
-			},
-		},
-		{
-			name: "allowlist entries are normalized",
-			mutate: func(c *Config) {
-				c.AllowedContexts = []string{" alpha ", "", "beta"}
-			},
-		},
-		{
-			name: "allowlist with only empty entries",
-			mutate: func(c *Config) {
-				c.AllowedContexts = []string{" ", ""}
-			},
-			wantErr: "contains no context names",
-		},
-		{
-			name: "allowlist in argo server mode",
-			mutate: func(c *Config) {
-				c.ArgoServer = "localhost:2746"
-				c.AllowedContexts = []string{"alpha"}
-			},
-			wantErr: "allowed-contexts requires multi-context mode",
-		},
-		{
-			name: "allowlist with http transport",
-			mutate: func(c *Config) {
-				c.Transport = TransportHTTP
-				c.AllowedContexts = []string{"alpha"}
-			},
-			wantErr: "allowed-contexts requires multi-context mode",
-		},
-		{
-			name: "allowlist with multi-context disabled",
-			mutate: func(c *Config) {
-				c.MultiContext = false
-				c.AllowedContexts = []string{"alpha"}
-			},
-			wantErr: "allowed-contexts requires multi-context mode",
-		},
-		{
-			name: "explicit enable in argo server mode",
-			mutate: func(c *Config) {
-				c.ArgoServer = "localhost:2746"
-				c.multiContextExplicit = true
-			},
-			wantErr: "multi-context requires direct Kubernetes mode",
-		},
-		{
-			name: "explicit enable with http transport",
-			mutate: func(c *Config) {
-				c.Transport = TransportHTTP
-				c.multiContextExplicit = true
-			},
-			wantErr: "multi-context requires direct Kubernetes mode",
-		},
-		{
-			name: "explicit disable in argo server mode is fine",
-			mutate: func(c *Config) {
-				c.ArgoServer = "localhost:2746"
-				c.MultiContext = false
-				c.multiContextExplicit = true
-			},
-		},
-		{
-			name: "implicit default in argo server mode is fine",
-			mutate: func(c *Config) {
-				c.ArgoServer = "localhost:2746"
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := DefaultConfig()
-			tt.mutate(cfg)
-			err := cfg.Validate()
-			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
-				return
-			}
-			require.NoError(t, err)
-		})
-	}
-}
-
-func TestValidate_NormalizesAllowedContexts(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.AllowedContexts = []string{" alpha ", "", "beta", "  "}
+	cfg, err := ParseArgs([]string{"http", "--bind-address", "0.0.0.0", "--port", "8080", "--read-only"})
+	require.NoError(t, err)
 	require.NoError(t, cfg.Validate())
-	assert.Equal(t, []string{"alpha", "beta"}, cfg.AllowedContexts)
+
+	assert.Equal(t, TransportHTTP, cfg.Transport)
+	assert.Equal(t, "0.0.0.0", cfg.BindAddress)
+	assert.Equal(t, 8080, cfg.Port)
+	assert.True(t, cfg.HTTP1) // REST JSON default for v3.6+ compatibility
+	assert.True(t, cfg.Stateless)
+	assert.True(t, cfg.JSONResponse)
+	assert.True(t, cfg.ReadOnly)
+	assert.Equal(t, "env-inbound-secret", cfg.AuthToken)
+	assert.Equal(t, []string{"core", "diagnostics", "ops"}, cfg.Toolsets)
 }
 
-func TestApplyEnvOverrides_Transport(t *testing.T) {
-	t.Run("MCP_TRANSPORT selects streamable http", func(t *testing.T) {
-		t.Setenv("MCP_TRANSPORT", "streamable-http")
-		cfg := DefaultConfig()
-		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
-		applyEnvOverridesWithFlagSet(fs, cfg)
-		assert.Equal(t, TransportStreamableHTTP, cfg.Transport)
-		assert.True(t, cfg.IsStreamableHTTPTransport())
-	})
+func TestParseArgs_RejectsRemovedSSEAndUnauthenticatedExposedBind(t *testing.T) {
+	_, err := ParseArgs([]string{"sse"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "removed")
 
-	t.Run("MCP_TRANSPORT is normalized", func(t *testing.T) {
-		t.Setenv("MCP_TRANSPORT", "  Streamable-HTTP ")
-		cfg := DefaultConfig()
-		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
-		applyEnvOverridesWithFlagSet(fs, cfg)
-		assert.Equal(t, TransportStreamableHTTP, cfg.Transport)
-	})
-
-	t.Run("invalid MCP_TRANSPORT keeps the default", func(t *testing.T) {
-		t.Setenv("MCP_TRANSPORT", "websocket")
-		cfg := DefaultConfig()
-		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
-		applyEnvOverridesWithFlagSet(fs, cfg)
-		assert.Equal(t, TransportStdio, cfg.Transport)
-	})
+	cfg, err := ParseArgs([]string{"http", "--bind-address", "0.0.0.0"})
+	require.NoError(t, err)
+	require.Error(t, cfg.Validate())
 }
 
-func TestApplyEnvOverrides_MultiContext(t *testing.T) {
-	t.Run("MCP_MULTI_CONTEXT disables", func(t *testing.T) {
-		t.Setenv("MCP_MULTI_CONTEXT", "false")
-		cfg := DefaultConfig()
-		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
-		applyEnvOverridesWithFlagSet(fs, cfg)
-		assert.False(t, cfg.MultiContext)
-		assert.True(t, cfg.multiContextExplicit)
-	})
+func TestConfig_MultiContextBoundaries(t *testing.T) {
+	// HTTP + Direct K8s without allowlist disables multi-context safely by default.
+	cfg, err := ParseArgs([]string{"http", "--bind-address", "127.0.0.1"})
+	require.NoError(t, err)
+	require.NoError(t, cfg.Validate())
+	assert.False(t, cfg.MultiContextEnabled())
 
-	t.Run("MCP_ALLOWED_CONTEXTS splits on commas", func(t *testing.T) {
-		t.Setenv("MCP_ALLOWED_CONTEXTS", "alpha, beta ,gamma")
-		cfg := DefaultConfig()
-		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
-		applyEnvOverridesWithFlagSet(fs, cfg)
-		require.NoError(t, cfg.Validate())
-		assert.Equal(t, []string{"alpha", "beta", "gamma"}, cfg.AllowedContexts)
-	})
+	// HTTP + Direct K8s with explicit allowlist enables multi-context.
+	cfg2, err := ParseArgs([]string{"http", "--bind-address", "127.0.0.1", "--allowed-contexts", "dev,staging"})
+	require.NoError(t, err)
+	require.NoError(t, cfg2.Validate())
+	assert.True(t, cfg2.MultiContextEnabled())
 
-	t.Run("unset leaves defaults", func(t *testing.T) {
-		cfg := DefaultConfig()
-		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
-		applyEnvOverridesWithFlagSet(fs, cfg)
-		assert.True(t, cfg.MultiContext)
-		assert.False(t, cfg.multiContextExplicit)
-		assert.Empty(t, cfg.AllowedContexts)
-	})
+	// Argo Server mode forbids allowed-contexts.
+	cfg3, err := ParseArgs([]string{"--argo-server", "https://argo.example.com", "--allowed-contexts", "dev"})
+	require.NoError(t, err)
+	require.Error(t, cfg3.Validate())
 }

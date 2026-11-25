@@ -1,0 +1,81 @@
+# =============================================================================
+# 主推场景：华为云公网 ELB -> CCE Istio IngressGateway -> mcp-for-argo-workflows (ClusterIP)
+# 链路：
+#   团队成员客户端 (HTTPS POST https://<公网域名>/mcp/argo-workflows)
+#   -> 华为云公网 ELB (HTTPS 443 + 公司出口 IP 白名单)
+#   -> CCE Istio IngressGateway (VirtualService 精确匹配 /mcp/argo-workflows 重写为 /mcp)
+#   -> argo 命名空间: mcp-for-argo-workflows Service (ClusterIP:8080) -> 2 副本无状态 Pod
+#   -> 集群内网 REST JSON 直连 argo-server.argo.svc.cluster.local:2746 (兼容 v3.6+ ~ v4.x)
+# 优势：
+#   - 纯 Argo Server 模式：automountServiceAccountToken=false，Pod 零 K8s 凭证暴露
+#   - 默认 --argo-http1=true：无损兼容 Argo Workflows v3.6 存量字段并支持子路径反代
+#   - /healthz 不对外暴露，仅集群内 kubelet 探针访问
+# =============================================================================
+
+replicaCount: 2
+
+image:
+  # 替换为已同步到华为云 SWR 或私有仓库的镜像地址，例如：
+  # repository: swr.cn-north-4.myhuaweicloud.com/<your-org>/mcp-for-argo-workflows
+  repository: "<REPLACE_WITH_YOUR_SYNCED_IMAGE_REPO>"
+  tag: "0.6.0"
+
+# 使用华为云 SWR 私有镜像仓库时保留（CCE 命名空间通常内置 default-secret）
+imagePullSecrets:
+  - name: default-secret
+
+service:
+  type: ClusterIP
+  port: 8080
+
+istio:
+  virtualService:
+    enabled: true
+    # 华为云 ASM 1.18 使用 networking.istio.io/v1alpha3
+    apiVersion: networking.istio.io/v1alpha3
+    hosts:
+      - "<REPLACE_WITH_YOUR_PUBLIC_DOMAIN>"
+    gateways:
+      - "<REPLACE_WITH_YOUR_ISTIO_GATEWAY>"
+    # 精确匹配并重写为 /mcp，不暴露 /healthz，避免与 /argo 或 /argocd 前缀冲突
+    path: "/mcp/argo-workflows"
+    timeout: "60s"
+
+  authorizationPolicy:
+    enabled: false
+
+# 生产默认：纯 Argo Server 模式（支持 Workflow Archive 与子路径反代）
+argo:
+  mode: "argo-server"
+  # 若集群内 argo-server 以 --secure=false 运行，改为 http://argo-server.argo.svc.cluster.local:2746 并将 secure 设为 false
+  serverUrl: "https://argo-server.argo.svc.cluster.local:2746"
+  namespace: "argo"
+  http1: true
+  secure: true
+  insecureSkipVerify: false
+  # 若 argo-server 使用集群内自签 HTTPS 证书，开启 caCert 并引用现有 ConfigMap 或 Secret
+  caCert:
+    enabled: false
+    existingSecret: ""
+    secretKey: "tls.crt"
+
+# 预先通过 kubectl -n argo create secret generic mcp-for-argo-workflows-secrets ... 创建
+secrets:
+  create: false
+  existingSecret: "mcp-for-argo-workflows-secrets"
+
+mcp:
+  toolsets: "core,diagnostics"
+  # 面向公网入口与多人分发，强烈保持只读硬锁（12 个高信噪比只读工具）
+  readOnly: true
+  # 开启严格 Host 头校验（与上方 istio.virtualService.hosts 中的公网域名一致）
+  allowedHostHeaders:
+    - "<REPLACE_WITH_YOUR_PUBLIC_DOMAIN>"
+  # 按需限定允许访问的命名空间白名单（空表示不限制，受 ARGO_TOKEN RBAC 约束）
+  allowedNamespaces: []
+  deniedNamespaces:
+    - "kube-system"
+    - "kube-public"
+    - "kube-node-lease"
+  allowClusterTemplates: false
+  allowArchiveDelete: false

@@ -5,7 +5,7 @@ package version
 //
 //nolint:gochecknoglobals // Build-time injected variables
 var (
-	Version   = "dev"
+	Version   = "0.6.0"
 	Commit    = "unknown"
 	BuildTime = "unknown"
 )

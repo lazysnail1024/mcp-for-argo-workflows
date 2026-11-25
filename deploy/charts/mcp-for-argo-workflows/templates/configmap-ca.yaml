@@ -1,0 +1,12 @@
+{{- if and (eq .Values.argo.mode "argo-server") .Values.argo.caCert.enabled .Values.argo.caCert.pem -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mcp-argo-workflows.caConfigMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mcp-argo-workflows.labels" . | nindent 4 }}
+data:
+  ca.crt: |
+    {{- .Values.argo.caCert.pem | nindent 4 }}
+{{- end }}

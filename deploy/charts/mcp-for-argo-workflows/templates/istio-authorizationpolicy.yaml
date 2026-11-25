@@ -1,0 +1,47 @@
+{{- if .Values.istio.authorizationPolicy.enabled -}}
+{{- if empty .Values.istio.authorizationPolicy.allowedRemoteIpBlocks -}}
+{{- fail "istio.authorizationPolicy.allowedRemoteIpBlocks must be non-empty when istio.authorizationPolicy.enabled=true" -}}
+{{- end -}}
+{{- $hosts := .Values.istio.authorizationPolicy.hosts | default .Values.istio.virtualService.hosts -}}
+{{- if empty $hosts -}}
+{{- fail "istio.authorizationPolicy.hosts (or istio.virtualService.hosts) must be non-empty when istio.authorizationPolicy.enabled=true" -}}
+{{- end -}}
+{{- $path := trimSuffix "/" (.Values.istio.authorizationPolicy.path | default .Values.istio.virtualService.path) -}}
+{{- if empty $path -}}
+{{- fail "istio.authorizationPolicy.path (or istio.virtualService.path) must be a non-root path" -}}
+{{- end -}}
+# =============================================================================
+# 使用 action: DENY + notRemoteIpBlocks，仅拦截命中本 MCP 路径且非白名单 IP 的请求，
+# 绝对不会影响共享 Istio IngressGateway 上的 /argo、/argocd 或其他已有业务路由！
+# 注意：公网 ELB 场景下使用 remoteIpBlocks 依赖 Istio 网关正确配置 numTrustedProxies >= 1。
+# =============================================================================
+apiVersion: {{ .Values.istio.authorizationPolicy.apiVersion | default "security.istio.io/v1beta1" }}
+kind: AuthorizationPolicy
+metadata:
+  name: {{ printf "%s-ip-guard" (include "mcp-argo-workflows.fullname" .) | trunc 63 | trimSuffix "-" }}
+  namespace: {{ .Values.istio.authorizationPolicy.namespace | default "istio-system" }}
+  labels:
+    {{- include "mcp-argo-workflows.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- toYaml .Values.istio.authorizationPolicy.gatewaySelector | nindent 6 }}
+  action: DENY
+  rules:
+    - from:
+        - source:
+            notRemoteIpBlocks:
+              {{- toYaml .Values.istio.authorizationPolicy.allowedRemoteIpBlocks | nindent 14 }}
+      to:
+        - operation:
+            hosts:
+              {{- range $hosts }}
+              - {{ . | quote }}
+              {{- if not (contains ":" .) }}
+              - {{ printf "%s:*" . | quote }}
+              {{- end }}
+              {{- end }}
+            paths:
+              - {{ $path | quote }}
+              - {{ printf "%s/" $path | quote }}
+{{- end }}

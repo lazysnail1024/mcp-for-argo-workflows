@@ -1,0 +1,41 @@
+# =============================================================================
+# 备选场景：无 Argo Server 时的纯 Direct Kubernetes 模式
+# 特点：
+#   - argo.mode="kubernetes"：仅通过集群内 ServiceAccount 直连 K8s API，绝不混用 Argo Server
+#   - Chart 自动开启 automountServiceAccountToken=true 并创建最小权限 RBAC（默认只读）
+#   - 注意：Direct K8s 模式无法访问 Argo Server SQL Archive（get_workflow/recover_workflow 仅查 Live 态）
+# =============================================================================
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/lazysnail1024/mcp-for-argo-workflows
+  tag: "0.6.0"
+
+service:
+  type: ClusterIP
+  port: 8080
+
+argo:
+  mode: "kubernetes"
+  namespace: "argo"
+
+rbac:
+  create: true
+  # 仅观察单命名空间时保持 clusterScope=false；跨命名空间排障可改为 true
+  clusterScope: false
+  readOnly: true
+
+secrets:
+  create: false
+  existingSecret: "mcp-for-argo-workflows-secrets"
+
+mcp:
+  toolsets: "core,diagnostics"
+  readOnly: true
+  allowedNamespaces:
+    - "argo"
+  deniedNamespaces:
+    - "kube-system"
+    - "kube-public"
+    - "kube-node-lease"

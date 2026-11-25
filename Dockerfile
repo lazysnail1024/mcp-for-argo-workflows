@@ -1,51 +1,47 @@
-# Build stage
-FROM golang:1.27.1-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS builder
+# syntax=docker/dockerfile:1
+
+# Build stage: compile statically on build host native architecture (zero QEMU/CGO overhead)
+FROM --platform=$BUILDPLATFORM golang:1.27.1-bookworm AS builder
 
 WORKDIR /app
 
-# Install build dependencies for CGO
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libc6-dev \
-    && rm -rf /var/lib/apt/lists/*
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 
-# Copy go mod files first for better caching
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source code
-COPY . .
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+COPY pkg/ ./pkg/
 
-# Build arguments for version info
-ARG VERSION=dev
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG VERSION=0.6.0
 ARG COMMIT=unknown
 ARG BUILD_TIME=unknown
 
-# Build with CGO enabled for full Kubernetes client compatibility
-# Note: Using single quotes around variable values to handle special characters safely
-RUN CGO_ENABLED=1 go build \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -trimpath \
     -ldflags="-s -w \
         -X 'github.com/pipekit/mcp-for-argo-workflows/internal/version.Version=${VERSION}' \
         -X 'github.com/pipekit/mcp-for-argo-workflows/internal/version.Commit=${COMMIT}' \
         -X 'github.com/pipekit/mcp-for-argo-workflows/internal/version.BuildTime=${BUILD_TIME}'" \
-    -o mcp-for-argo-workflows \
+    -o /out/mcp-for-argo-workflows \
     ./cmd/mcp-for-argo-workflows
 
-# Runtime stage - use distroless for minimal attack surface
-# Pinned by digest for reproducible builds and supply-chain stability
-FROM gcr.io/distroless/base-debian12:nonroot@sha256:7f0c72cd138b442ae0deeb69c08b1acf5525439ba251a49ad93c320a061567e5
+# Runtime stage: minimal static distroless image (root CA bundle included, zero shell/libc)
+FROM gcr.io/distroless/static-debian12:nonroot
 
-# Labels for container metadata
-LABEL org.opencontainers.image.title="MCP for Argo Workflows"
-LABEL org.opencontainers.image.description="MCP server for Argo Workflows providing AI tool access to workflow operations"
-LABEL org.opencontainers.image.source="https://github.com/pipekit/mcp-for-argo-workflows"
-LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.title="mcp-for-argo-workflows" \
+      org.opencontainers.image.description="Stateless, Dual-Era MCP server for Argo Workflows (v3.6+ and v4.x)" \
+      org.opencontainers.image.source="https://github.com/lazysnail1024/mcp-for-argo-workflows" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
-# Copy binary from builder
-COPY --from=builder /app/mcp-for-argo-workflows /mcp-for-argo-workflows
+COPY --from=builder /out/mcp-for-argo-workflows /mcp-for-argo-workflows
 
-# Run as non-root user (distroless:nonroot already sets this)
-USER nonroot:nonroot
+EXPOSE 8080
+USER 1000:1000
 
-# Default entrypoint
 ENTRYPOINT ["/mcp-for-argo-workflows"]
+CMD ["http"]

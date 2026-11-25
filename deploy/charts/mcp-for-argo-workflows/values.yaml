@@ -1,0 +1,200 @@
+# =============================================================================
+# mcp-for-argo-workflows Helm Chart 默认配置
+# 适配镜像: ghcr.io/lazysnail1024/mcp-for-argo-workflows:0.6.0 (无状态 Streamable HTTP /mcp)
+# 兼容 Argo Workflows v3.6+ 与 v4.x；支持纯 Argo Server 模式或纯 Direct K8s 模式
+# =============================================================================
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/lazysnail1024/mcp-for-argo-workflows
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+# - name: default-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  # argo.mode=argo-server 时无需访问 K8s API，默认关闭 SA Token 自动挂载；
+  # argo.mode=kubernetes 时自动挂载最小权限 ServiceAccount。
+  automount: false
+  annotations: {}
+  name: ""
+
+rbac:
+  # 仅在 argo.mode=kubernetes 时生效：自动创建最小权限 RBAC（只读或按需含读写）
+  create: true
+  # clusterScope=true 创建 ClusterRole/ClusterRoleBinding，false 创建命名空间内 Role/RoleBinding
+  clusterScope: false
+  readOnly: true
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+  nodePort: null
+  annotations: {}
+
+istio:
+  virtualService:
+    enabled: false
+    apiVersion: networking.istio.io/v1alpha3
+    annotations: {}
+    hosts: []
+    gateways: []
+    # 默认精确路径 /mcp/argo-workflows，重写为 /mcp，不暴露 /healthz 且不与 /argo 前缀冲突
+    path: "/mcp/argo-workflows"
+    timeout: "60s"
+
+  authorizationPolicy:
+    enabled: false
+    apiVersion: security.istio.io/v1beta1
+    namespace: "istio-system"
+    gatewaySelector:
+      istio: ingressgateway
+    hosts: []
+    path: ""
+    allowedRemoteIpBlocks: []
+
+# =============================================================================
+# 下游 Argo Workflows 连接配置（二选一，严禁混用）
+#   - mode: "argo-server"（推荐生产默认，支持 Archive 与反代子路径）
+#   - mode: "kubernetes"（无 Argo Server 时直接走集群内 K8s API）
+# =============================================================================
+argo:
+  mode: "argo-server"
+  # 仅 mode=argo-server 时生效；支持 http(s)://host:port[/subpath]
+  serverUrl: "https://argo-server.argo.svc.cluster.local:2746"
+  namespace: "argo"
+  # 默认启用 REST JSON (HTTP1) 以无损兼容 v3.6 存量字段并穿透反代子路径
+  http1: true
+  secure: true
+  insecureSkipVerify: false
+
+  # 私有/自签 CA 证书挂载（通过 Go 原生 SSL_CERT_FILE + --argo-ca-cert 生效）
+  caCert:
+    enabled: false
+    pem: ""
+    existingConfigMap: ""
+    configMapKey: "ca.crt"
+    existingSecret: ""
+    secretKey: "tls.crt"
+    mountPath: "/etc/ssl/argo-ca"
+
+  # 多实例域名绑定 Token 注册表（支持 mtime 热重载）
+  tokenRegistry:
+    enabled: false
+    createSecret: false
+    existingSecret: ""
+    secretKey: "tokens.json"
+    mountPath: "/etc/mcp/token-registry"
+    entries: []
+
+mcp:
+  bindAddress: "0.0.0.0"
+  port: 8080
+  stateless: true
+  jsonResponse: true
+  legacyMode: "stateless"
+  allowUnauthenticated: false
+  allowedHostHeaders: []
+  allowedOrigins: []
+  toolsets: "core,diagnostics"
+  tools: []
+  readOnly: true
+  allowedNamespaces: []
+  deniedNamespaces:
+    - "kube-system"
+    - "kube-public"
+    - "kube-node-lease"
+  allowClusterTemplates: false
+  allowArchiveDelete: false
+  maxResponseBytes: 65536
+
+secrets:
+  create: false
+  existingSecret: "mcp-for-argo-workflows-secrets"
+  mcpAuthToken: ""
+  mcpRequestStateSecret: ""
+  argoToken: ""
+  keys:
+    mcpAuthToken: "MCP_AUTH_TOKEN"
+    mcpRequestStateSecret: "MCP_REQUEST_STATE_SECRET"
+    argoToken: "ARGO_TOKEN"
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 75
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: false
+  ingress: []
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+podAntiAffinityPreset: "soft"
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []

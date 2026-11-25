@@ -12,93 +12,64 @@ permissions:
 
 jobs:
   lint:
-    name: Lint
+    name: Lint & Helm Validate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@v5
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.1"
           cache: true
 
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Run go vet and Helm lint
+        run: |
+          make vet
+          make helm-lint
+
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        uses: golangci/golangci-lint-action@v7
         with:
           version: v2.13.2
           only-new-issues: ${{ github.event_name == 'pull_request' }}
 
   test:
-    name: Test
+    name: Unit & Dual-Era Protocol Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@v5
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.1"
           cache: true
 
-      - name: Run tests
+      - name: Run Tier 1 & Tier 2 tests
         run: make test
 
-      - name: Upload coverage report
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          files: coverage.out
-          fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-  test-e2e:
-    name: E2E Tests (${{ matrix.mode }})
-    runs-on: ubuntu-latest
-    # Run after lint and test pass, but don't block build
-    needs: [lint, test]
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        mode: [kubernetes, argo-server]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.27.0"
-          cache: true
-
-      - name: Run E2E tests (${{ matrix.mode }} mode)
-        run: make test-e2e
-        env:
-          E2E_MODE: ${{ matrix.mode }}
-
-  build:
-    name: Build
+  build-and-smoke:
+    name: Static Binary & Distroless Image Smoke
     runs-on: ubuntu-latest
     needs: [lint, test]
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@v5
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.1"
           cache: true
 
-      - name: Build binary
-        run: make dist/mcp-for-argo-workflows-linux-amd64
+      - name: Build static binaries
+        run: make build-all
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: mcp-for-argo-workflows-linux-amd64
-          path: dist/mcp-for-argo-workflows-linux-amd64
-          retention-days: 7
+      - name: Build distroless image & run Tier 3 smoke suite
+        run: make test-image

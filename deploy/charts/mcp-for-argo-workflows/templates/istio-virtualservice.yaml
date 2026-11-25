@@ -1,0 +1,45 @@
+{{- if .Values.istio.virtualService.enabled -}}
+{{- if empty .Values.istio.virtualService.hosts -}}
+{{- fail "istio.virtualService.hosts must be non-empty when istio.virtualService.enabled=true" -}}
+{{- end -}}
+{{- if empty .Values.istio.virtualService.gateways -}}
+{{- fail "istio.virtualService.gateways must be non-empty when istio.virtualService.enabled=true" -}}
+{{- end -}}
+{{- $path := trimSuffix "/" .Values.istio.virtualService.path -}}
+{{- if empty $path -}}
+{{- fail "istio.virtualService.path must be a non-root path such as /mcp/argo-workflows" -}}
+{{- end -}}
+apiVersion: {{ .Values.istio.virtualService.apiVersion | default "networking.istio.io/v1alpha3" }}
+kind: VirtualService
+metadata:
+  name: {{ include "mcp-argo-workflows.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mcp-argo-workflows.labels" . | nindent 4 }}
+  {{- with .Values.istio.virtualService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  hosts:
+    {{- toYaml .Values.istio.virtualService.hosts | nindent 4 }}
+  gateways:
+    {{- toYaml .Values.istio.virtualService.gateways | nindent 4 }}
+  http:
+    - name: {{ include "mcp-argo-workflows.fullname" . }}
+      match:
+        - uri:
+            exact: {{ $path | quote }}
+        - uri:
+            exact: {{ printf "%s/" $path | quote }}
+      rewrite:
+        uri: /mcp
+      {{- if .Values.istio.virtualService.timeout }}
+      timeout: {{ .Values.istio.virtualService.timeout }}
+      {{- end }}
+      route:
+        - destination:
+            host: {{ printf "%s.%s.svc.cluster.local" (include "mcp-argo-workflows.fullname" .) .Release.Namespace }}
+            port:
+              number: {{ .Values.service.port }}
+{{- end }}

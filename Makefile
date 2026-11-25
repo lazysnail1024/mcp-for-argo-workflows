@@ -1,11 +1,15 @@
-# Project variables
 BINARY_NAME := mcp-for-argo-workflows
 MODULE := github.com/pipekit/mcp-for-argo-workflows
 DIST_DIR := dist
-DOCKER_IMAGE := ghcr.io/pipekit/mcp-for-argo-workflows
+IMAGE_NAME ?= ghcr.io/lazysnail1024/mcp-for-argo-workflows
+IMAGE_TAG ?= 0.6.0
+IMAGE := $(IMAGE_NAME):$(IMAGE_TAG)
+DOCKER_BUILD_FLAGS ?= --network=host
+GOPROXY ?= https://proxy.golang.org,direct
+KIND_CLUSTER ?= kind
+ARGO_VERSION ?= v3.6.5
 
-# Build variables
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+VERSION ?= $(IMAGE_TAG)
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS := -s -w \
@@ -13,187 +17,95 @@ LDFLAGS := -s -w \
 	-X $(MODULE)/internal/version.Commit=$(COMMIT) \
 	-X $(MODULE)/internal/version.BuildTime=$(BUILD_TIME)
 
-# Go variables
-GO := go
+GO ?= go
 GOFMT := gofmt
-GOIMPORTS := goimports
 GOLANGCI_LINT := golangci-lint
+HELM ?= helm
 
-# Source files for dependency tracking (exclude dist/ and vendor/)
-GO_FILES := $(shell find . -name '*.go' -type f -not -path './dist/*' -not -path './vendor/*')
-GO_MOD := go.mod go.sum
+.DEFAULT_GOAL := help
+.PHONY: help fmt vet lint test build build-all clean docker-build docker-build-multiarch docker-push test-image helm-lint kind-load test-e2e-kind clean-e2e-kind
 
-# Platform-specific binary paths
-DIST_DARWIN_AMD64 := $(DIST_DIR)/$(BINARY_NAME)-darwin-amd64
-DIST_DARWIN_ARM64 := $(DIST_DIR)/$(BINARY_NAME)-darwin-arm64
-DIST_LINUX_AMD64 := $(DIST_DIR)/$(BINARY_NAME)-linux-amd64
-DIST_LINUX_ARM64 := $(DIST_DIR)/$(BINARY_NAME)-linux-arm64
-DIST_WINDOWS_AMD64 := $(DIST_DIR)/$(BINARY_NAME)-windows-amd64.exe
-DIST_CHECKSUMS := $(DIST_DIR)/checksums.txt
+help: ## Show available make targets
+	@grep -hE '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
+		| sort \
+		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
-# All distribution binaries
-DIST_BINARIES := $(DIST_DARWIN_AMD64) $(DIST_DARWIN_ARM64) $(DIST_LINUX_AMD64) $(DIST_LINUX_ARM64) $(DIST_WINDOWS_AMD64)
+fmt: ## Format Go source files
+	$(GOFMT) -s -w cmd internal pkg
 
-.PHONY: all test test-e2e test-e2e-kubernetes test-e2e-argo-server lint lint-fix fmt vet clean tools help build-all dist-clean \
-	docker-build docker-build-multiarch docker-push
-
-# Default target
-all: fmt vet lint test $(DIST_LINUX_AMD64)
-
-## test: Run tests with race detection and coverage
-test:
-	@echo "Running tests..."
-	$(GO) test -race -coverprofile=coverage.out -covermode=atomic ./internal/... ./pkg/...
-	@echo "Coverage report: coverage.out"
-
-## test-e2e: Run end-to-end tests (requires Docker)
-## Use E2E_MODE=kubernetes (default) or E2E_MODE=argo-server to select connection mode
-test-e2e:
-	@echo "Running E2E tests (mode: $${E2E_MODE:-kubernetes})..."
-	E2E_MODE=$${E2E_MODE:-kubernetes} $(GO) test -tags=e2e -v -timeout=20m ./test/e2e/...
-
-## test-e2e-kubernetes: Run E2E tests using direct Kubernetes API mode
-test-e2e-kubernetes:
-	@echo "Running E2E tests (Kubernetes API mode)..."
-	E2E_MODE=kubernetes $(GO) test -tags=e2e -v -timeout=20m ./test/e2e/...
-
-## test-e2e-argo-server: Run E2E tests using Argo Server mode
-test-e2e-argo-server:
-	@echo "Running E2E tests (Argo Server mode)..."
-	E2E_MODE=argo-server $(GO) test -tags=e2e -v -timeout=20m ./test/e2e/...
-
-## lint: Run golangci-lint
-lint:
-	@echo "Running linter..."
-	$(GOLANGCI_LINT) run ./...
-
-## lint-fix: Run golangci-lint with auto-fix
-lint-fix:
-	@echo "Running linter with auto-fix..."
-	$(GOLANGCI_LINT) run --fix ./...
-
-## fmt: Run gofmt and goimports
-fmt:
-	@echo "Formatting code..."
-	$(GOFMT) -s -w .
-	@if command -v $(GOIMPORTS) >/dev/null 2>&1; then \
-		$(GOIMPORTS) -w -local $(MODULE) .; \
-	else \
-		echo "goimports not installed, skipping import formatting"; \
-	fi
-
-## vet: Run go vet
-vet:
-	@echo "Running go vet..."
+vet: ## Run go vet
 	$(GO) vet ./...
 
-## clean: Remove build artifacts
-clean:
-	@echo "Cleaning..."
-	@rm -rf $(DIST_DIR)/
-	@rm -f coverage.out coverage.html
-	@echo "Clean complete"
+lint: ## Run golangci-lint (if installed) and go vet
+	$(GO) vet ./...
+	@if command -v $(GOLANGCI_LINT) >/dev/null 2>&1; then \
+		$(GOLANGCI_LINT) run ./...; \
+	else \
+		echo "golangci-lint not found in PATH; go vet passed"; \
+	fi
 
-## tools: Install development dependencies
-tools:
-	@echo "Installing development tools..."
-	$(GO) install golang.org/x/tools/cmd/goimports@latest
-	@echo "Note: Install golangci-lint from https://golangci-lint.run/welcome/install/"
+test: ## Run Tier 1 unit and Tier 2 Dual-Era protocol integration tests
+	$(GO) test -race -coverprofile=coverage.out -covermode=atomic ./internal/... ./pkg/...
 
-## help: Show this help message
-help:
-	@echo "Available targets:"
-	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/## /  /'
-
-# =============================================================================
-# Cross-compilation targets (real file targets with dependencies)
-# =============================================================================
-
-## build-all: Build binaries for all platforms
-build-all: $(DIST_BINARIES) $(DIST_CHECKSUMS)
-	@echo "All platform builds complete. Binaries in $(DIST_DIR)/"
-
-# macOS Intel
-$(DIST_DARWIN_AMD64): $(GO_FILES) $(GO_MOD)
-	@echo "Building for darwin/amd64..."
+build: ## Build static binary for current platform
 	@mkdir -p $(DIST_DIR)
-	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o $@ ./cmd/$(BINARY_NAME)
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/$(BINARY_NAME) ./cmd/$(BINARY_NAME)
 
-# macOS Apple Silicon
-$(DIST_DARWIN_ARM64): $(GO_FILES) $(GO_MOD)
-	@echo "Building for darwin/arm64..."
+build-all: ## Cross-compile static binaries for linux/darwin/windows
 	@mkdir -p $(DIST_DIR)
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -ldflags="$(LDFLAGS)" -o $@ ./cmd/$(BINARY_NAME)
+	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/$(BINARY_NAME)
+	CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/$(BINARY_NAME)-linux-arm64 ./cmd/$(BINARY_NAME)
+	CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/$(BINARY_NAME)
+	CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/$(BINARY_NAME)
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/$(BINARY_NAME)-windows-amd64.exe ./cmd/$(BINARY_NAME)
 
-# Linux x86_64
-$(DIST_LINUX_AMD64): $(GO_FILES) $(GO_MOD)
-	@echo "Building for linux/amd64..."
-	@mkdir -p $(DIST_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o $@ ./cmd/$(BINARY_NAME)
+clean: ## Remove local build and coverage artifacts
+	rm -rf $(DIST_DIR) coverage.out coverage.html
 
-# Linux ARM64
-$(DIST_LINUX_ARM64): $(GO_FILES) $(GO_MOD)
-	@echo "Building for linux/arm64..."
-	@mkdir -p $(DIST_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -ldflags="$(LDFLAGS)" -o $@ ./cmd/$(BINARY_NAME)
-
-# Windows x86_64
-$(DIST_WINDOWS_AMD64): $(GO_FILES) $(GO_MOD)
-	@echo "Building for windows/amd64..."
-	@mkdir -p $(DIST_DIR)
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o $@ ./cmd/$(BINARY_NAME)
-
-## checksums: Generate SHA256 checksums for all binaries
-$(DIST_CHECKSUMS): $(DIST_BINARIES)
-	@echo "Generating checksums..."
-	@cd $(DIST_DIR) && shasum -a 256 $(BINARY_NAME)-* > checksums.txt
-	@echo "Checksums written to $(DIST_CHECKSUMS)"
-
-## dist-clean: Remove distribution artifacts
-dist-clean:
-	@echo "Cleaning dist directory..."
-	@rm -rf $(DIST_DIR)/
-
-# =============================================================================
-# Docker targets
-# =============================================================================
-
-## docker-build: Build Docker image for local platform
-docker-build:
-	@echo "Building Docker image $(DOCKER_IMAGE):$(VERSION)..."
-	docker build \
+docker-build: ## Build production static distroless container image ($(IMAGE))
+	docker build $(DOCKER_BUILD_FLAGS) \
+		--build-arg GOPROXY=$(GOPROXY) \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg COMMIT=$(COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t $(DOCKER_IMAGE):$(VERSION) \
-		-t $(DOCKER_IMAGE):$(COMMIT) \
-		-t $(DOCKER_IMAGE):latest \
+		-t $(IMAGE) \
 		.
 
-## docker-build-multiarch: Build multi-architecture Docker image (requires docker buildx, no local load)
-## Note: Multi-arch builds cannot be loaded into local docker daemon; use docker-push to push to registry
-docker-build-multiarch:
-	@echo "Building multi-arch Docker image $(DOCKER_IMAGE):$(VERSION)..."
-	docker buildx build \
+docker-build-multiarch: ## Build multi-architecture Docker image (linux/amd64, linux/arm64)
+	docker buildx build $(DOCKER_BUILD_FLAGS) \
 		--platform linux/amd64,linux/arm64 \
+		--build-arg GOPROXY=$(GOPROXY) \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg COMMIT=$(COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t $(DOCKER_IMAGE):$(VERSION) \
-		-t $(DOCKER_IMAGE):$(COMMIT) \
-		-t $(DOCKER_IMAGE):latest \
+		-t $(IMAGE) \
 		.
 
-## docker-push: Build and push multi-architecture Docker image to registry
-docker-push:
-	@echo "Building and pushing multi-arch Docker image $(DOCKER_IMAGE):$(VERSION)..."
-	docker buildx build \
+docker-push: ## Build and push multi-architecture Docker image to registry
+	docker buildx build $(DOCKER_BUILD_FLAGS) \
 		--platform linux/amd64,linux/arm64 \
+		--build-arg GOPROXY=$(GOPROXY) \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg COMMIT=$(COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t $(DOCKER_IMAGE):$(VERSION) \
-		-t $(DOCKER_IMAGE):$(COMMIT) \
-		-t $(DOCKER_IMAGE):latest \
+		-t $(IMAGE) \
 		--push \
 		.
+
+helm-lint: ## Lint and template-validate the Helm Chart
+	$(HELM) lint deploy/charts/mcp-for-argo-workflows
+	$(HELM) lint deploy/charts/mcp-for-argo-workflows -f deploy/charts/mcp-for-argo-workflows/examples/values-cce-istio.yaml
+	$(HELM) lint deploy/charts/mcp-for-argo-workflows -f deploy/charts/mcp-for-argo-workflows/examples/values-kubernetes-direct.yaml
+
+test-image: docker-build ## Run Tier 3 black-box container smoke tests against $(IMAGE)
+	IMAGE=$(IMAGE) bash scripts/test-image.sh
+
+kind-load: docker-build ## Load $(IMAGE) into local kind cluster ($(KIND_CLUSTER))
+	kind load docker-image $(IMAGE) --name $(KIND_CLUSTER)
+
+test-e2e-kind: kind-load ## Run Tier 4 live kind 2-replica E2E acceptance suite (ARGO_VERSION=$(ARGO_VERSION))
+	IMAGE=$(IMAGE) KIND_CLUSTER=$(KIND_CLUSTER) ARGO_VERSION=$(ARGO_VERSION) bash scripts/run-e2e-kind.sh
+
+clean-e2e-kind: ## Remove isolated E2E test namespaces and ClusterRBAC from kind cluster
+	kubectl delete ns mcp-wf-e2e-system mcp-wf-e2e-work mcp-wf-e2e-denied --ignore-not-found
+	kubectl delete clusterrole,clusterrolebinding e2e-mcp-argo-cwt-reader mcp-wf-e2e-k8s-mcp-for-argo-workflows --ignore-not-found
