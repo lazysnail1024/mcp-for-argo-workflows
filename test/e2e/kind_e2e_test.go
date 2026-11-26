@@ -362,14 +362,36 @@ func TestKindE2E_FullAcceptance(t *testing.T) {
 			t.Fatalf("unexpected render_workflow_graph output (isErr=%v): %s", isErr, graphText)
 		}
 
-		// 5. get_workflow_logs with grep filter + spotlighting
-		logsText, isErr := env.callTool2025(t, env.BaseURL, "get_workflow_logs", map[string]any{
+		// 5. get_workflow_logs without node defaults to scope="auto" -> targets ONLY failed pod (no prep-succeeded noise!)
+		logsAutoText, isErr := env.callTool2025(t, env.BaseURL, "get_workflow_logs", map[string]any{
 			"namespace": env.WorkNS,
 			"name":      "e2e-failed-dag",
-			"grep":      "FATAL",
 		}, "e2e-sre-alice")
-		if isErr || !strings.Contains(logsText, "FATAL: simulated exit 42") || !strings.Contains(logsText, "<untrusted_workflow_log ") {
-			t.Fatalf("unexpected get_workflow_logs output (isErr=%v): %s", isErr, logsText)
+		if isErr || !strings.Contains(logsAutoText, `"resolvedScope":"failed_nodes"`) ||
+			!strings.Contains(logsAutoText, "FATAL: simulated exit 42") ||
+			!strings.Contains(logsAutoText, "<untrusted_workflow_log ") ||
+			strings.Contains(logsAutoText, "prep-succeeded") {
+			t.Fatalf("expected smart failed-only get_workflow_logs (no succeeded pod logs), got isErr=%v: %s", isErr, logsAutoText)
+		}
+
+		// 5b. get_workflow_logs with scope="all" explicitly merges all pods (including prep-succeeded)
+		logsAllText, isErr := env.callTool2025(t, env.BaseURL, "get_workflow_logs", map[string]any{
+			"namespace": env.WorkNS,
+			"name":      "e2e-failed-dag",
+			"scope":     "all",
+		}, "e2e-sre-alice")
+		if isErr || !strings.Contains(logsAllText, `"resolvedScope":"all_pods"`) || !strings.Contains(logsAllText, "prep-succeeded") {
+			t.Fatalf("expected scope=all merged logs including prep-succeeded, got isErr=%v: %s", isErr, logsAllText)
+		}
+
+		// 5c. get_workflow_logs with scope="failed" on a running/suspended workflow returns zero failed pods cleanly
+		logsNoFailText, isErr := env.callTool2025(t, env.BaseURL, "get_workflow_logs", map[string]any{
+			"namespace": env.WorkNS,
+			"name":      "e2e-suspend-wf",
+			"scope":     "failed",
+		}, "e2e-sre-alice")
+		if isErr || !strings.Contains(logsNoFailText, `"resolvedScope":"failed_nodes"`) || !strings.Contains(logsNoFailText, "No failed or error Pod nodes found") {
+			t.Fatalf("expected clean no-failed-pods message, got isErr=%v: %s", isErr, logsNoFailText)
 		}
 
 		// 6. get_workflow_events (via Argo Server WatchEvents snapshot — zero K8s client!)

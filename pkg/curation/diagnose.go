@@ -621,6 +621,102 @@ func splitRootAndCascadingFailures(wf *wfv1.Workflow, failed []AbnormalNodeDetai
 	return roots, cascading
 }
 
+// SelectLogTargetNodes picks leaf Pod/Container nodes to fetch logs from when the caller
+// omits an explicit node selector.
+//   - scope="failed": selects only Failed/Error leaf pods (root-cause failures ordered first).
+//   - scope="auto": prioritizes Failed/Error leaf pods, then Running leaf pods, and returns
+//     resolvedScope="all_pods" (with nil targets) only when none are failed or running.
+//   - scope="all": immediately returns resolvedScope="all_pods".
+func SelectLogTargetNodes(wf *wfv1.Workflow, scope string, maxNodes int) (selected []wfv1.NodeStatus, omittedNames []string, resolvedScope string) {
+	normScope := strings.ToLower(strings.TrimSpace(scope))
+	if normScope == "" {
+		normScope = "auto"
+	}
+	if normScope == "all" || wf == nil || len(wf.Status.Nodes) == 0 {
+		if normScope == "failed" {
+			return nil, nil, "failed_nodes"
+		}
+		return nil, nil, "all_pods"
+	}
+	if maxNodes <= 0 {
+		maxNodes = 5
+	}
+
+	isLoggableLeaf := func(n wfv1.NodeStatus) bool {
+		return n.Type == wfv1.NodeTypePod || n.Type == wfv1.NodeTypeContainer
+	}
+
+	// 1. Collect Failed/Error leaf pods with root-cause failures prioritized first.
+	failedAll := extractNodesByFilter(wf, func(n *wfv1.NodeStatus) bool {
+		return n.Phase == wfv1.NodeFailed || n.Phase == wfv1.NodeError
+	})
+	if len(failedAll) > 0 {
+		roots, cascading := splitRootAndCascadingFailures(wf, failedAll)
+		ordered := make([]wfv1.NodeStatus, 0, len(failedAll))
+		seen := make(map[string]bool, len(failedAll))
+		for _, list := range [][]AbnormalNodeDetail{roots, cascading} {
+			for _, d := range list {
+				if seen[d.ID] {
+					continue
+				}
+				if node, ok := wf.Status.Nodes[d.ID]; ok && isLoggableLeaf(node) {
+					seen[d.ID] = true
+					ordered = append(ordered, node)
+				}
+			}
+		}
+		if len(ordered) > 0 {
+			if len(ordered) <= maxNodes {
+				return ordered, nil, "failed_nodes"
+			}
+			omitted := make([]string, 0, len(ordered)-maxNodes)
+			for _, n := range ordered[maxNodes:] {
+				label := n.DisplayName
+				if label == "" {
+					label = n.Name
+				}
+				if label == "" {
+					label = n.ID
+				}
+				omitted = append(omitted, fmt.Sprintf("%s (%s)", label, n.ID))
+			}
+			return ordered[:maxNodes], omitted, "failed_nodes"
+		}
+	}
+
+	if normScope == "failed" {
+		return nil, nil, "failed_nodes"
+	}
+
+	// 2. For scope="auto", if no pods failed, target active Running leaf pods.
+	runningDetails := extractNodesByFilter(wf, func(n *wfv1.NodeStatus) bool {
+		return n.Phase == wfv1.NodeRunning && isLoggableLeaf(*n)
+	})
+	if len(runningDetails) > 0 {
+		running := make([]wfv1.NodeStatus, 0, len(runningDetails))
+		for _, d := range runningDetails {
+			if node, ok := wf.Status.Nodes[d.ID]; ok {
+				running = append(running, node)
+			}
+		}
+		if len(running) <= maxNodes {
+			return running, nil, "running_nodes"
+		}
+		omitted := make([]string, 0, len(running)-maxNodes)
+		for _, n := range running[maxNodes:] {
+			label := n.DisplayName
+			if label == "" {
+				label = n.ID
+			}
+			omitted = append(omitted, fmt.Sprintf("%s (%s)", label, n.ID))
+		}
+		return running[:maxNodes], omitted, "running_nodes"
+	}
+
+	// 3. No failed or running pods (e.g., Succeeded workflow): fall back to workflow-wide logs.
+	return nil, nil, "all_pods"
+}
+
 func hasDescendant(wf *wfv1.Workflow, nodeID, targetID string, visited map[string]bool) bool {
 	if visited[nodeID] {
 		return false

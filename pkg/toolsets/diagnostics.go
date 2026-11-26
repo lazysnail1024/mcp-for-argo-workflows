@@ -13,6 +13,7 @@ import (
 	"github.com/argoproj/argo-workflows/v4/pkg/apiclient/workflowtemplate"
 	wfv1 "github.com/argoproj/argo-workflows/v4/pkg/apis/workflow/v1alpha1"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/pipekit/mcp-for-argo-workflows/pkg/argo"
@@ -111,24 +112,41 @@ type getWorkflowLogsInput struct {
 	Namespace string `json:"namespace,omitempty" jsonschema:"Kubernetes namespace (uses default if omitted)"`
 	Name      string `json:"name" jsonschema:"Workflow name,required"`
 	Node      string `json:"node,omitempty" jsonschema:"Node ID, displayName, or PodName (recommended; automatically resolves Argo v3.6+ PodName v2)"`
+	Scope     string `json:"scope,omitempty" jsonschema:"Target pod selection when node is omitted: auto (default; automatically targets failed/error pods first, then running pods, falling back to all pods only if none failed/running), failed (strictly failed/error pods only), or all (workflow-wide merged pod stream),enum=auto,enum=failed,enum=all"`
 	Container string `json:"container,omitempty" jsonschema:"Container name: auto (default; probes main/init/wait intelligently), main, init, or wait"`
 	TailLines int64  `json:"tailLines,omitempty" jsonschema:"Number of tail lines to return (default: 100, max: 500)"`
 	Grep      string `json:"grep,omitempty" jsonschema:"Filter log lines containing this string"`
 }
 
-type getWorkflowLogsOutput struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
-	PodName   string `json:"podName,omitempty"`
-	Container string `json:"container"`
-	Truncated bool   `json:"truncated,omitempty"`
-	Logs      string `json:"logs"`
+type podLogEntry struct {
+	NodeID      string `json:"nodeId"`
+	DisplayName string `json:"displayName,omitempty"`
+	PodName     string `json:"podName"`
+	Phase       string `json:"phase,omitempty"`
+	Container   string `json:"container"`
+	Truncated   bool   `json:"truncated,omitempty"`
+	Logs        string `json:"logs"`
 }
+
+type getWorkflowLogsOutput struct {
+	Name          string        `json:"name"`
+	Namespace     string        `json:"namespace"`
+	ResolvedScope string        `json:"resolvedScope,omitempty"`
+	PodName       string        `json:"podName,omitempty"`
+	Container     string        `json:"container,omitempty"`
+	Truncated     bool          `json:"truncated,omitempty"`
+	Logs          string        `json:"logs,omitempty"`
+	PodLogs       []podLogEntry `json:"podLogs,omitempty"`
+	OmittedNodes  []string      `json:"omittedNodes,omitempty"`
+	Message       string        `json:"message,omitempty"`
+}
+
+const maxAutoScopedLogPods = 5
 
 func registerGetWorkflowLogs(s *mcp.Server, deps Dependencies) {
 	tool := &mcp.Tool{
 		Name:        "get_workflow_logs",
-		Description: "Fetch sanitized, prompt-injection-isolated logs from a workflow or specific node (auto-resolves Argo v3.6+ PodName v2 and falls back across init/main/wait containers when container=\"auto\"). Hard-capped at 32KB.",
+		Description: "Fetch sanitized, prompt-injection-isolated logs from a workflow or specific node (auto-resolves Argo v3.6+ PodName v2 and probes init/main/wait when container=\"auto\"). When node is omitted, scope=\"auto\" (default) targets ONLY failed/error pods first (root-cause prioritized) instead of merging succeeded pods; pass scope=\"failed\" for strict failed-only or scope=\"all\" for merged workflow-wide logs. Hard-capped at 32KB.",
 		Annotations: readOnlyAnnotations(),
 	}
 	hint := "Pass a specific node ID/displayName, smaller tailLines (e.g. 50), or grep filter."
@@ -154,10 +172,20 @@ func registerGetWorkflowLogs(s *mcp.Server, deps Dependencies) {
 			container = "auto"
 		}
 
+		scope := strings.ToLower(strings.TrimSpace(in.Scope))
+		if scope == "" {
+			scope = "auto"
+		}
+		switch scope {
+		case "auto", "failed", "all":
+		default:
+			return nil, nil, fmt.Errorf("invalid scope %q: must be \"auto\", \"failed\", or \"all\"", in.Scope)
+		}
+
 		wfName := strings.TrimSpace(in.Name)
 		meta.Resource = wfName
 
-		// If node selector is supplied, resolve exact PodName v2 via the workflow object.
+		// Case 1: Caller specified an explicit node ID, displayName, or PodName.
 		if nodeSel := strings.TrimSpace(in.Node); nodeSel != "" {
 			wf, _, wfErr := curation.FetchWorkflowTransparent(ctx, client, ns, wfName, "")
 			if wfErr == nil && wf != nil {
@@ -172,12 +200,13 @@ func registerGetWorkflowLogs(s *mcp.Server, deps Dependencies) {
 						wrapped = fmt.Sprintf("<untrusted_workflow_log pod=%q container=%q>\n(no log lines returned)\n</untrusted_workflow_log>", pod, usedContainer)
 					}
 					return &getWorkflowLogsOutput{
-						Name:      wfName,
-						Namespace: ns,
-						PodName:   pod,
-						Container: usedContainer,
-						Truncated: truncated,
-						Logs:      wrapped,
+						Name:          wfName,
+						Namespace:     ns,
+						ResolvedScope: "single_node",
+						PodName:       pod,
+						Container:     usedContainer,
+						Truncated:     truncated,
+						Logs:          wrapped,
 					}, nil, nil
 				}
 			}
@@ -185,17 +214,121 @@ func registerGetWorkflowLogs(s *mcp.Server, deps Dependencies) {
 			if err := argo.ValidatePathSegment(nodeSel, "node"); err != nil {
 				return nil, nil, err
 			}
-			return fetchDirectWorkflowLogs(ctx, client, ns, wfName, nodeSel, container, tailLines, in.Grep)
+			return fetchDirectWorkflowLogs(ctx, client, ns, wfName, nodeSel, "single_node", container, tailLines, in.Grep)
 		}
 
-		return fetchDirectWorkflowLogs(ctx, client, ns, wfName, "", container, tailLines, in.Grep)
+		// Case 2: Caller explicitly requested merged workflow-wide logs across all pods.
+		if scope == "all" {
+			return fetchDirectWorkflowLogs(ctx, client, ns, wfName, "", "all_pods", container, tailLines, in.Grep)
+		}
+
+		// Case 3: Smart pod scoping (scope="auto" or "failed"): inspect workflow topology first
+		// so failed/running pods are queried directly without being crowded out by succeeded pods.
+		wf, _, wfErr := curation.FetchWorkflowTransparent(ctx, client, ns, wfName, "")
+		if wfErr != nil || wf == nil {
+			if scope == "failed" {
+				return nil, nil, argo.FormatAgentError("get_workflow_logs", wfErr)
+			}
+			return fetchDirectWorkflowLogs(ctx, client, ns, wfName, "", "all_pods", container, tailLines, in.Grep)
+		}
+
+		targets, omitted, resolvedScope := curation.SelectLogTargetNodes(wf, scope, maxAutoScopedLogPods)
+		if len(targets) == 0 {
+			if scope == "failed" {
+				return &getWorkflowLogsOutput{
+					Name:          wfName,
+					Namespace:     ns,
+					ResolvedScope: "failed_nodes",
+					Message: fmt.Sprintf(
+						"No failed or error Pod nodes found in workflow %s/%s (phase=%s). Pass scope=\"all\" or a specific node to inspect succeeded or running pods.",
+						ns, wfName, curation.NormalizeWorkflowPhase(string(wf.Status.Phase)),
+					),
+				}, nil, nil
+			}
+			return fetchDirectWorkflowLogs(ctx, client, ns, wfName, "", "all_pods", container, tailLines, in.Grep)
+		}
+
+		// Single matched target pod (most common failure case): return compact top-level logs directly.
+		if len(targets) == 1 {
+			node := targets[0]
+			pod, usedContainer, wrapped, truncated, logErr := curation.FetchSmartNodeLogs(
+				ctx, client, wf, &node, container, tailLines, in.Grep, governance.DefaultMaxLogBytes,
+			)
+			if logErr != nil {
+				return nil, nil, argo.FormatAgentError("get_workflow_logs", logErr)
+			}
+			if wrapped == "" {
+				wrapped = fmt.Sprintf("<untrusted_workflow_log pod=%q container=%q>\n(no log lines returned)\n</untrusted_workflow_log>", pod, usedContainer)
+			}
+			out := &getWorkflowLogsOutput{
+				Name:          wfName,
+				Namespace:     ns,
+				ResolvedScope: resolvedScope,
+				PodName:       pod,
+				Container:     usedContainer,
+				Truncated:     truncated,
+				Logs:          wrapped,
+				OmittedNodes:  omitted,
+			}
+			if len(omitted) > 0 {
+				out.Message = fmt.Sprintf("Showing logs for prioritized node %q; %d additional matching node(s) omitted (pass node=\"<id>\" to inspect them).", node.DisplayName, len(omitted))
+			}
+			return out, nil, nil
+		}
+
+		// Multiple failed/running pods: fetch concurrently with per-pod byte budgets staying within 32KB total.
+		perPodBudget := max(governance.DefaultMaxLogBytes/len(targets), 4096)
+		entries := make([]podLogEntry, len(targets))
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(maxAutoScopedLogPods)
+
+		for i := range targets {
+			idx := i
+			node := targets[idx]
+			g.Go(func() error {
+				pod, usedContainer, wrapped, truncated, logErr := curation.FetchSmartNodeLogs(
+					gCtx, client, wf, &node, container, tailLines, in.Grep, perPodBudget,
+				)
+				if logErr != nil {
+					if pod == "" {
+						pod = compat.ResolveNodePodName(wf, &node)
+					}
+					wrapped = fmt.Sprintf("<untrusted_workflow_log pod=%q container=%q>\n(failed to fetch logs: %s)\n</untrusted_workflow_log>", pod, usedContainer, governance.GuardUntrustedSnippet(logErr.Error(), 240))
+				} else if wrapped == "" {
+					wrapped = fmt.Sprintf("<untrusted_workflow_log pod=%q container=%q>\n(no log lines returned)\n</untrusted_workflow_log>", pod, usedContainer)
+				}
+				entries[idx] = podLogEntry{
+					NodeID:      node.ID,
+					DisplayName: node.DisplayName,
+					PodName:     pod,
+					Phase:       curation.NormalizeWorkflowPhase(string(node.Phase)),
+					Container:   usedContainer,
+					Truncated:   truncated,
+					Logs:        wrapped,
+				}
+				return nil
+			})
+		}
+		_ = g.Wait()
+
+		out := &getWorkflowLogsOutput{
+			Name:          wfName,
+			Namespace:     ns,
+			ResolvedScope: resolvedScope,
+			PodLogs:       entries,
+			OmittedNodes:  omitted,
+		}
+		if len(omitted) > 0 {
+			out.Message = fmt.Sprintf("Showing logs for %d prioritized %s; %d additional matching node(s) omitted (pass node=\"<id>\" to inspect them).", len(entries), resolvedScope, len(omitted))
+		}
+		return out, nil, nil
 	})
 }
 
 func fetchDirectWorkflowLogs(
 	ctx context.Context,
 	client argo.ClientInterface,
-	ns, wfName, podName, container string,
+	ns, wfName, podName, resolvedScope, container string,
 	tailLines int64,
 	grep string,
 ) (*getWorkflowLogsOutput, *mcp.CallToolResult, error) {
@@ -253,12 +386,13 @@ func fetchDirectWorkflowLogs(
 	}
 	guarded, truncated := governance.CleanAndGuardLogs(sb.String(), labelPod, container, governance.DefaultMaxLogBytes)
 	return &getWorkflowLogsOutput{
-		Name:      wfName,
-		Namespace: ns,
-		PodName:   podName,
-		Container: container,
-		Truncated: truncated,
-		Logs:      guarded,
+		Name:          wfName,
+		Namespace:     ns,
+		ResolvedScope: resolvedScope,
+		PodName:       podName,
+		Container:     container,
+		Truncated:     truncated,
+		Logs:          guarded,
 	}, nil, nil
 }
 

@@ -169,3 +169,83 @@ func TestRenderWorkflowGraph_MermaidAndCollapseSucceeded(t *testing.T) {
 	assert.Contains(t, asciiRes.Graph, "step-fail [Failed]")
 	assert.Contains(t, asciiRes.Graph, "step-ok-1 [Succeeded]")
 }
+
+func TestSelectLogTargetNodes(t *testing.T) {
+	now := time.Now()
+	wf := &wfv1.Workflow{
+		ObjectMeta: metav1.ObjectMeta{Name: "dag-logs"},
+		Status: wfv1.WorkflowStatus{
+			Phase: wfv1.WorkflowFailed,
+			Nodes: wfv1.Nodes{
+				"dag-logs": {
+					ID: "dag-logs", Type: wfv1.NodeTypeDAG, Phase: wfv1.NodeFailed,
+					Children: []string{"ok-1", "fail-root"},
+				},
+				"ok-1": {
+					ID: "ok-1", DisplayName: "ok-1", BoundaryID: "dag-logs",
+					Type: wfv1.NodeTypePod, Phase: wfv1.NodeSucceeded,
+					StartedAt: metav1.Time{Time: now.Add(-4 * time.Minute)},
+				},
+				"fail-root": {
+					ID: "fail-root", DisplayName: "fail-root", BoundaryID: "dag-logs",
+					Type: wfv1.NodeTypePod, Phase: wfv1.NodeFailed,
+					Children:   []string{"fail-cascade"},
+					StartedAt:  metav1.Time{Time: now.Add(-3 * time.Minute)},
+					FinishedAt: metav1.Time{Time: now.Add(-2 * time.Minute)},
+				},
+				"fail-cascade": {
+					ID: "fail-cascade", DisplayName: "fail-cascade", BoundaryID: "dag-logs",
+					Type: wfv1.NodeTypePod, Phase: wfv1.NodeError,
+					StartedAt: metav1.Time{Time: now.Add(-1 * time.Minute)},
+				},
+			},
+		},
+	}
+
+	// auto prioritizes root-cause failed leaf pod first, then cascading failed leaf pod, excluding DAG & Succeeded pods.
+	sel, omitted, scope := SelectLogTargetNodes(wf, "auto", 1)
+	assert.Equal(t, "failed_nodes", scope)
+	require.Len(t, sel, 1)
+	assert.Equal(t, "fail-root", sel[0].ID)
+	require.Len(t, omitted, 1)
+	assert.Contains(t, omitted[0], "fail-cascade")
+
+	// all immediately falls back to all_pods.
+	selAll, _, scopeAll := SelectLogTargetNodes(wf, "all", 5)
+	assert.Empty(t, selAll)
+	assert.Equal(t, "all_pods", scopeAll)
+
+	// Running workflow with no failures: auto targets running pod; failed returns 0 pods cleanly.
+	runningWf := &wfv1.Workflow{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-wf"},
+		Status: wfv1.WorkflowStatus{
+			Phase: wfv1.WorkflowRunning,
+			Nodes: wfv1.Nodes{
+				"ok":  {ID: "ok", Type: wfv1.NodeTypePod, Phase: wfv1.NodeSucceeded},
+				"run": {ID: "run", DisplayName: "worker", Type: wfv1.NodeTypePod, Phase: wfv1.NodeRunning},
+			},
+		},
+	}
+	selRun, _, scopeRun := SelectLogTargetNodes(runningWf, "auto", 5)
+	assert.Equal(t, "running_nodes", scopeRun)
+	require.Len(t, selRun, 1)
+	assert.Equal(t, "run", selRun[0].ID)
+
+	selNone, _, scopeNone := SelectLogTargetNodes(runningWf, "failed", 5)
+	assert.Equal(t, "failed_nodes", scopeNone)
+	assert.Empty(t, selNone)
+
+	// Succeeded workflow: auto falls back to all_pods.
+	okWf := &wfv1.Workflow{
+		ObjectMeta: metav1.ObjectMeta{Name: "ok-wf"},
+		Status: wfv1.WorkflowStatus{
+			Phase: wfv1.WorkflowSucceeded,
+			Nodes: wfv1.Nodes{
+				"ok": {ID: "ok", Type: wfv1.NodeTypePod, Phase: wfv1.NodeSucceeded},
+			},
+		},
+	}
+	selOk, _, scopeOk := SelectLogTargetNodes(okWf, "auto", 5)
+	assert.Equal(t, "all_pods", scopeOk)
+	assert.Empty(t, selOk)
+}
